@@ -1,6 +1,7 @@
 package com.obdscanner.app.ui.screens
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.compose.LifecycleResumeEffect
@@ -63,6 +64,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import com.obdscanner.app.UiState
 
+// BLUETOOTH_CONNECT is only requested when hasPermission is false, which only happens on Android 12+.
+@SuppressLint("InlinedApi")
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ConnectScreen(state: UiState, viewModel: ObdViewModel, onOpenSettings: () -> Unit) {
@@ -300,7 +303,7 @@ private val blePermissions: Array<String> =
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
     } else {
-        arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)
     }
 
 /** Scan for Bluetooth LE adapters (e.g. Innova, Vgate iCar Pro BLE, OBDLink CX) and connect to one. */

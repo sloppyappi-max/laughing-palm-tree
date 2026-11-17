@@ -22,9 +22,7 @@ jobs:
         run: ./gradlew :obd-core:test :app:assembleDebug --stacktrace
 
       - name: Android Lint
-        run: |
-          ./gradlew :app:lintDebug
-          cat app/build/reports/lint-results-debug.txt
+        run: ./gradlew :app:lintDebug
 
       - name: Upload lint report
         if: always()
