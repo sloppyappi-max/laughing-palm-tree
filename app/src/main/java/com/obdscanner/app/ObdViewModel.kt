@@ -119,6 +119,7 @@ data class UiState(
     val customPids: List<Pid> = emptyList(),
     val scan: ScanState = ScanState(),
     val explorer: ExplorerState = ExplorerState(),
+    val vehicleRetrying: Boolean = false,
 ) {
     val units: UnitSystem get() = settings.units
     val favorites: List<Int> get() = settings.favorites
@@ -447,22 +448,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                 _state.update { it.copy(connection = ConnectionState.Connecting(target, "Initializing adapter…")) }
                 val info = obd.initialize()
                 client = obd
-                val supported = if (info.vehicleResponding) obd.supportedPids() else emptySet()
-                // The VIN tells us the year and make, used to search trouble codes online.
-                val vin = if (info.vehicleResponding) runCatching { obd.readVin() }.getOrNull() else null
-                // Check-engine light status for the status line under every screen title.
-                val monitor = if (info.vehicleResponding) runCatching { obd.monitorStatus() }.getOrNull() else null
-                ensureActive()
-                _state.update {
-                    it.copy(
-                        connection = ConnectionState.Connected(target, info),
-                        supportedPids = supported,
-                        codes = CodesState(monitor = monitor),
-                        vin = vin,
-                        batteryVoltage = info.batteryVoltage,
-                    )
-                }
-                _state.update { it.copy(moduleAccess = obd.supportsModuleAccess).let { s -> s.copy(customPids = buildCustomPids(s)) } }
+                showVehicle(obd, target, info)
                 saved?.let(::saveAdapter)
                 if (liveActive) startPolling()
             } catch (e: CancellationException) {
@@ -476,6 +462,51 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                         diagnostics = diagnostics?.invoke(),
                     )
                 }
+            }
+        }
+    }
+
+    /** After connecting (or retrying): reads what the car supports and shows it. */
+    private suspend fun CoroutineScope.showVehicle(obd: ObdClient, target: AdapterTarget, info: AdapterInfo) {
+        val supported = if (info.vehicleResponding) obd.supportedPids() else emptySet()
+        // The VIN tells us the year and make, used to search trouble codes online.
+        val vin = if (info.vehicleResponding) runCatching { obd.readVin() }.getOrNull() else null
+        // Check-engine light status for the status line under every screen title.
+        val monitor = if (info.vehicleResponding) runCatching { obd.monitorStatus() }.getOrNull() else null
+        ensureActive()
+        _state.update {
+            it.copy(
+                connection = ConnectionState.Connected(target, info),
+                supportedPids = supported,
+                codes = CodesState(monitor = monitor),
+                vin = vin,
+                batteryVoltage = info.batteryVoltage,
+                moduleAccess = obd.supportsModuleAccess,
+            ).let { s -> s.copy(customPids = buildCustomPids(s)) }
+        }
+    }
+
+    /**
+     * Runs car detection again without reconnecting to the adapter — for when the car didn't answer
+     * at first (ignition was off, or the adapter's automatic protocol search failed).
+     */
+    fun retryVehicle() {
+        val obd = client ?: return
+        val connected = _state.value.connection as? ConnectionState.Connected ?: return
+        if (_state.value.vehicleRetrying) return
+        launchForConnection {
+            _state.update { it.copy(vehicleRetrying = true) }
+            try {
+                val info = obd.detectVehicle(connected.info.elmVersion)
+                ensureActive()
+                showVehicle(obd, connected.target, info)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (!isActive) return@launchForConnection
+                lostConnection(e)
+            } finally {
+                _state.update { it.copy(vehicleRetrying = false) }
             }
         }
     }

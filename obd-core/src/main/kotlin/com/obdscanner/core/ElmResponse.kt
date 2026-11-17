@@ -70,6 +70,11 @@ object ElmResponseParser {
                     multiFrameLength = line.toInt(16)
                 }
                 frameMatch != null && multiFrame != null -> multiFrame!!.append(frameMatch.groupValues[2])
+                hexLine.matches(line) && stripCanHeader(line) != null -> {
+                    // Adapters that ignore ATH0 (some brand dongles) still put the sender's ID in front.
+                    finishMultiFrame()
+                    messages += stripCanHeader(line)!!
+                }
                 hexLine.matches(line) && line.length % 2 == 0 -> {
                     finishMultiFrame()
                     messages += hexToBytes(line)
@@ -82,6 +87,24 @@ object ElmResponseParser {
         // Negative responses (7F <mode> <code>) mean the ECU rejected the request.
         val positive = messages.filterNot { it.isNotEmpty() && it.u(0) == 0x7F }
         return if (positive.isEmpty()) ObdResponse.NoData else ObdResponse.Data(positive)
+    }
+
+    /**
+     * Recognises a single-frame CAN answer printed with headers on — 11-bit `7E8 06 41 00 …` or
+     * 29-bit `18DAF110 06 41 00 …` — and returns just the data bytes. The length byte must match
+     * the rest of the line, so ordinary header-less data is never mistaken for it.
+     */
+    fun stripCanHeader(line: String): ByteArray? {
+        val headerLength = when {
+            line.length % 2 == 1 && line.length >= 7 && line[0] == '7' -> 3 // 11-bit diagnostic IDs 7xx
+            line.length >= 12 && line.startsWith("18DA") -> 8 // 29-bit; no positive answer starts with 0x18
+            else -> return null
+        }
+        val rest = hexToBytes(line.substring(headerLength))
+        if (rest.isEmpty()) return null
+        val length = rest.u(0)
+        if (length !in 1..7 || length > rest.size - 1) return null
+        return rest.copyOfRange(1, 1 + length)
     }
 
     fun hexToBytes(hex: String): ByteArray {

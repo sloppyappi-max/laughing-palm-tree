@@ -60,4 +60,46 @@ class RegressionTest {
         client.read(Pids.SPEED)
         assertEquals(listOf("010C", "010D"), sim.sent)
     }
+
+    @Test
+    fun fallsBackToExplicitCanProtocolWhenAutoSearchFails() = runBlocking {
+        // Seen on a brand dongle: ATRV works, but automatic protocol search never finds the car.
+        val sim = SimulatedElmChannel(latencyMs = 0, autoSearchWorks = false)
+        val info = ObdClient(sim).initialize()
+        assertTrue(info.vehicleResponding)
+        assertTrue(sim.sent.contains("ATSP6"))
+        assertTrue(info.protocol!!.contains("CAN 11/500"))
+    }
+
+    @Test
+    fun reportsWhatTheAdapterSaidWhenTheCarDoesNotAnswer() = runBlocking {
+        val sim = SimulatedElmChannel(latencyMs = 0, protocol = "ISO 15765-4 (CAN 11/500)", autoSearchWorks = false)
+        // Simulate ignition off: every protocol fails.
+        val client = ObdClient(object : ElmChannel by sim {
+            override suspend fun exchange(command: String, timeoutMs: Long): String =
+                if (command.startsWith("01")) "SEARCHING...\rUNABLE TO CONNECT\r\r" else sim.exchange(command, timeoutMs)
+        })
+        val info = client.initialize()
+        assertFalse(info.vehicleResponding)
+        assertEquals("SEARCHING... | UNABLE TO CONNECT", info.probeResponse)
+        assertEquals("ATSP0", sim.sent.last { it.startsWith("ATSP") }) // left on automatic
+    }
+
+    @Test
+    fun understandsAdaptersThatIgnoreHeadersOff() = runBlocking {
+        val client = ObdClient(SimulatedElmChannel(latencyMs = 0, alwaysHeaders = true))
+        val info = client.initialize()
+        assertTrue(info.vehicleResponding)
+        assertTrue(Pids.RPM.code in client.supportedPids())
+        assertNotNull(client.read(Pids.RPM))
+    }
+
+    @Test
+    fun stripsCanHeadersOnlyWhenTheLengthByteMatches() {
+        assertEquals(listOf(0x41, 0x0D, 0x32), ElmResponseParser.stripCanHeader("7E803410D32")!!.map { it.toInt() and 0xFF })
+        assertEquals(listOf(0x41, 0x0D, 0x32), ElmResponseParser.stripCanHeader("18DAF11003410D32")!!.map { it.toInt() and 0xFF })
+        // Plain header-less data is left alone (even length, or length byte doesn't fit).
+        assertEquals(null, ElmResponseParser.stripCanHeader("410C1AF8"))
+        assertEquals(null, ElmResponseParser.stripCanHeader("7E8FF410D32"))
+    }
 }

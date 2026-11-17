@@ -20,6 +20,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -82,12 +85,7 @@ fun DashboardScreen(
     }
 
     if (!connection.info.vehicleResponding) {
-        Box(modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-            Hint(
-                "The adapter is connected, but the car isn't answering. Turn the ignition on (or start the engine), " +
-                    "then disconnect and connect again.",
-            )
-        }
+        NotRespondingCard(state, connection, onRetry = viewModel::retryVehicle, modifier = modifier)
         return
     }
 
@@ -416,5 +414,45 @@ private fun Sparkline(samples: List<Float>, modifier: Modifier = Modifier, alert
             if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
         }
         drawPath(path, color, style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round))
+    }
+}
+
+/** The adapter answers but the car doesn't: explain, show what the adapter said, and offer a retry. */
+@Composable
+private fun NotRespondingCard(
+    state: UiState,
+    connection: ConnectionState.Connected,
+    onRetry: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val volts = state.batteryVoltage
+    Column(
+        modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterVertically),
+    ) {
+        Text("The car isn't answering", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+        Hint(
+            when {
+                // ~13.5 V and up means the alternator is charging, i.e. the engine is running.
+                volts != null && volts >= 13.3 -> "The adapter is working and reads ${"%.1f".format(volts)} V, so the engine " +
+                    "seems to be running — the car should answer. Tap Try again: the app will also try the car's protocol " +
+                    "directly, which some adapters need."
+                else -> "The adapter is connected, but the car didn't answer. Turn the ignition on (or start the engine), " +
+                    "then tap Try again."
+            },
+        )
+        Button(onClick = onRetry, enabled = !state.vehicleRetrying) {
+            Text(if (state.vehicleRetrying) "Trying… (up to 40 s)" else "Try again")
+        }
+        if (state.vehicleRetrying) LinearProgressIndicator(Modifier.fillMaxWidth())
+        connection.info.probeResponse?.let { answer ->
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("What the adapter answered", style = MaterialTheme.typography.labelLarge)
+                    Text(answer, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                    Hint("Adapter: ${connection.info.elmVersion ?: "unknown"}. If Try again doesn't help, send a screenshot of this.")
+                }
+            }
+        }
     }
 }

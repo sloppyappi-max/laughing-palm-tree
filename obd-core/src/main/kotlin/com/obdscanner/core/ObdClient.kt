@@ -13,6 +13,8 @@ data class AdapterInfo(
     val vehicleResponding: Boolean,
     /** Control modules that answered OBD requests (engine, transmission, …). */
     val ecus: List<Ecu> = emptyList(),
+    /** What the adapter answered to the first request, shown when the car doesn't respond. */
+    val probeResponse: String? = null,
 )
 
 /** A control module that answers OBD-II requests, identified by its response header. */
@@ -102,23 +104,42 @@ class ObdClient(private val channel: ElmChannel) {
         delay(500) // genuine ELM327s need a moment after reset
         val version = ElmResponseParser.lines(reset, "ATZ").firstOrNull { it.contains("ELM", ignoreCase = true) }
 
-        for (cmd in listOf("ATE0", "ATL0", "ATS0", "ATH0", "ATAT1", "ATSP0")) {
+        for (cmd in listOf("ATE0", "ATL0", "ATS0", "ATH0", "ATAT1")) {
             send(cmd)
         }
+        return detectVehicle(version)
+    }
 
-        // The first request triggers the protocol search; it can take ~10 s.
-        val probe = ElmResponseParser.parse(send("0100", timeoutMs = 15_000), "0100")
-        val responding = probe is ObdResponse.Data
+    /**
+     * Finds the car's protocol: automatic search first, then each CAN protocol explicitly, because
+     * some adapters' automatic search doesn't lock on. Can be called again (e.g. after the user
+     * starts the engine) without resetting the adapter.
+     */
+    suspend fun detectVehicle(elmVersion: String? = null): AdapterInfo {
+        var lastRaw = ""
+        var responding = false
+        // 0 = automatic; 6/8 = CAN 11-bit / 29-bit at 500k (2008+ US cars), 7/9 = the same at 250k.
+        for ((index, protocolNumber) in listOf("0", "6", "8", "7", "9").withIndex()) {
+            send("ATSP$protocolNumber")
+            // The automatic search can take ~10 s on its first request.
+            lastRaw = runCatching { send("0100", timeoutMs = if (index == 0) 15_000 else 5_000) }
+                .getOrElse { if (it is ElmTimeoutException) "(no answer within the time limit)" else throw it }
+            responding = ElmResponseParser.parse(lastRaw, "0100") is ObdResponse.Data
+            if (responding) break
+        }
+        if (!responding) send("ATSP0") // leave the adapter searching automatically
+
         val protocol = if (responding) at("ATDP")?.removePrefix("AUTO, ") else null
         supportsModuleAccess = protocol?.contains("11/") == true
         isCan = protocol?.contains("15765") == true || protocol?.contains("CAN") == true
 
         return AdapterInfo(
             ecus = if (responding) runCatching { discoverEcus() }.getOrDefault(emptyList()) else emptyList(),
-            elmVersion = version,
+            elmVersion = elmVersion,
             protocol = protocol,
             batteryVoltage = batteryVoltage(),
             vehicleResponding = responding,
+            probeResponse = ElmResponseParser.lines(lastRaw, "0100").joinToString(" | ").ifEmpty { "(empty)" },
         )
     }
 

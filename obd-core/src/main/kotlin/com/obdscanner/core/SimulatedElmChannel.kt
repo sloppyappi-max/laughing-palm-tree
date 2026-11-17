@@ -16,7 +16,13 @@ class SimulatedElmChannel(
     private val vin: String = "1HGCM82633A004352",
     /** What ATDP reports. Anything without "CAN 11/" simulates a car without module access. */
     private val protocol: String = "ISO 15765-4 (CAN 11/500)",
+    /** False simulates an adapter whose automatic protocol search never locks on (needs ATSP6). */
+    private val autoSearchWorks: Boolean = true,
+    /** True simulates an adapter that ignores ATH0 and always prints CAN headers. */
+    private val alwaysHeaders: Boolean = false,
 ) : ElmChannel {
+
+    private var protocolNumber = "0"
 
     /** Every command received, for tests. */
     val sent: MutableList<String> = mutableListOf()
@@ -177,6 +183,9 @@ class SimulatedElmChannel(
         delay(latencyMs)
         val cmd = command.uppercase().replace(" ", "")
         sent += cmd
+        if (cmd.startsWith("ATSP")) protocolNumber = cmd.removePrefix("ATSP")
+        if (!autoSearchWorks && protocolNumber == "0" && !cmd.startsWith("AT")) return "SEARCHING...\rUNABLE TO CONNECT\r\r"
+        if (!autoSearchWorks && protocolNumber != "0" && protocolNumber != "6" && !cmd.startsWith("AT")) return "NO DATA\r\r"
         // On an older car, a 3-digit ATSH header makes every request go nowhere.
         if (!can11 && target != "7DF" && !cmd.startsWith("AT")) return "NO DATA\r\r"
         val body = when {
@@ -192,7 +201,11 @@ class SimulatedElmChannel(
             headers && cmd == "0100" && can11 -> "7E806" + hex(0x41, 0x00, *supportMask(0x00)) + "\r7E906" + hex(0x41, 0x00, 0x80, 0, 0, 0)
             headers && cmd == "0100" -> "486B10" + hex(0x41, 0x00, *supportMask(0x00)) + "00"
             // With headers on, normal answers carry the sender's ID, which breaks header-less parsing.
-            headers && cmd.length == 4 && cmd.startsWith("01") -> "7E804" + (pidBytes(cmd.substring(2).toInt(16))?.let { hex(0x41, cmd.substring(2).toInt(16), *it) } ?: "")
+            (headers || alwaysHeaders) && cmd.length == 4 && cmd.startsWith("01") -> {
+                val pid = cmd.substring(2).toInt(16)
+                val bytes = if (pid % 0x20 == 0) intArrayOf(0x41, pid, *supportMask(pid)) else pidBytes(pid)?.let { intArrayOf(0x41, pid, *it) }
+                bytes?.let { "7E8%02X".format(it.size) + hex(*it) } ?: "NO DATA"
+            }
             cmd.startsWith("AT") -> "OK"
             cmd == "03" -> dtcResponse(0x03, stored)
             cmd == "07" -> dtcResponse(0x07, pendingCodes)
