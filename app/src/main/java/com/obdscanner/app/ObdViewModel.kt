@@ -600,7 +600,10 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         pollJob = launchForConnection {
             // Refresh fast-changing values every round, and one slower value per round.
             // The list is re-read every round so favorites / "All sensors" apply immediately.
-            val fastCodes = setOf(Pids.RPM.code, Pids.SPEED.code, Pids.THROTTLE.code, Pids.ENGINE_LOAD.code, Pids.MAF.code)
+            // Fuel rate is "fast" too: the trip computer integrates it every round.
+            val fastCodes = setOf(
+                Pids.RPM.code, Pids.SPEED.code, Pids.THROTTLE.code, Pids.ENGINE_LOAD.code, Pids.MAF.code, Pids.FUEL_RATE.code,
+            )
             var slowIndex = 0
             var timeouts = 0
             while (isActive) {

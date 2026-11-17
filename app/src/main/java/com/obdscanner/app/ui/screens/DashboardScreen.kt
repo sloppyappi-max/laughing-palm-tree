@@ -190,8 +190,9 @@ private fun TripCard(state: UiState, onReset: () -> Unit) {
     val imperial = state.units == UnitSystem.IMPERIAL
     fun economy(l100: Double?): String = when {
         l100 == null -> "—"
-        imperial -> "%.1f".format(TripComputer.l100kmToMpg(l100))
-        else -> "%.1f".format(l100)
+        // Coasting burns almost nothing: show a cap instead of an absurd number.
+        imperial -> TripComputer.l100kmToMpg(l100).let { if (it > 99.9) "99+" else "%.1f".format(it) }
+        else -> if (l100 < 0.1) "0.0" else "%.1f".format(l100.coerceAtMost(99.9))
     }
     val economyUnit = if (imperial) "mpg" else "L/100 km"
     Card {
@@ -289,6 +290,10 @@ private fun AlertEditor(pid: Pid, alert: SensorAlert?, units: UnitSystem, onSave
     var low by remember(alert) { mutableStateOf(initial(alert?.low)) }
     var high by remember(alert) { mutableStateOf(initial(alert?.high)) }
     fun parse(text: String) = text.replace(',', '.').toDoubleOrNull()?.let { Units.toMetric(pid, it, units) }
+    val lowValue = parse(low)
+    val highValue = parse(high)
+    val invalid = (low.isNotBlank() && lowValue == null) || (high.isNotBlank() && highValue == null) ||
+        (lowValue != null && highValue != null && lowValue >= highValue)
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("Alert")
@@ -303,8 +308,14 @@ private fun AlertEditor(pid: Pid, alert: SensorAlert?, units: UnitSystem, onSave
                 modifier = Modifier.weight(1f), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
             )
         }
+        if (invalid) {
+            Text("Enter numbers, with \"below\" lower than \"above\".", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = { onSave(parse(low), parse(high)) }) { Text("Save alert") }
+            OutlinedButton(
+                onClick = { onSave(lowValue, highValue) },
+                enabled = !invalid && (lowValue != null || highValue != null),
+            ) { Text("Save alert") }
             if (alert != null) TextButton(onClick = { onSave(null, null) }) { Text("Remove") }
         }
     }
@@ -315,7 +326,10 @@ private fun Gauge(pid: Pid, value: Double?, units: UnitSystem, alerting: Boolean
     val track = MaterialTheme.colorScheme.surfaceVariant
     val fill = if (alerting) Danger else MaterialTheme.colorScheme.primary
     val shown = value?.let { Units.display(pid, it, units) }
-    val fraction = ((shown?.value ?: 0.0) / Units.gaugeMax(pid, units)).coerceIn(0.0, 1.0).toFloat()
+    // Scale from the sensor's minimum (e.g. -64° timing advance), not from zero.
+    val low = Units.display(pid, pid.min, units).value.coerceAtMost(0.0)
+    val high = Units.gaugeMax(pid, units)
+    val fraction = (((shown?.value ?: low) - low) / (high - low)).coerceIn(0.0, 1.0).toFloat()
     Card {
         Box(Modifier.fillMaxWidth().aspectRatio(1f).padding(14.dp), contentAlignment = Alignment.Center) {
             Canvas(Modifier.fillMaxSize()) {

@@ -66,7 +66,11 @@ fun SystemScanCard(state: UiState, viewModel: ObdViewModel) {
                 Hint(if (scan.full) "Full scan checks ~250 addresses and takes about a minute." else "Checking modules…")
             }
             scan.result?.let { result ->
-                if (result.reports.isEmpty()) Hint("No modules answered.")
+                if (result.reports.isEmpty()) {
+                    // Say why (e.g. "Scan failed: …") instead of hiding it in the shareable log.
+                    val reason = result.log.lineSequence().firstOrNull { it.startsWith("Scan failed") || it.startsWith("Module scan needs") }
+                    Hint(reason ?: "No modules answered.")
+                }
                 result.reports.forEach { report ->
                     HorizontalDivider()
                     ModuleRow(report)
