@@ -21,6 +21,16 @@ jobs:
       - name: Test protocol library and build debug APK
         run: ./gradlew :obd-core:test :app:assembleDebug --stacktrace
 
+      - name: Android Lint
+        run: ./gradlew :app:lintDebug
+
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-report
+          path: app/build/reports/lint-results-debug.html
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
