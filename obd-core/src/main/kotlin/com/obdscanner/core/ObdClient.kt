@@ -236,8 +236,14 @@ class ObdClient(private val channel: ElmChannel) {
         run("0100", 10_000) // the normal OBD-II broadcast
         run("ATH1")
         run("0100", 10_000) // who answers the broadcast, with their CAN IDs
-        run("ATSH7E0")
-        run("0100") // directly to the engine computer
+        run("0101") // check-engine light status
+        run("03", 10_000) // stored trouble codes
+        run("0902", 10_000) // VIN
+        run("ATSH7E0") // directly to the engine computer:
+        run("0100")
+        run("3E00") // "are you there" (TesterPresent)
+        run("1A90") // VIN, GM GMLAN style
+        run("22F190") // VIN, UDS style
         run("ATSH7E2")
         run("0100") // directly to the transmission
         run("ATH0")
