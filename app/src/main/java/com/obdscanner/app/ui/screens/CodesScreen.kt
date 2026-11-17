@@ -1,5 +1,7 @@
 package com.obdscanner.app.ui.screens
 
+import android.content.Intent
+import android.net.Uri
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -27,6 +29,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -36,11 +39,17 @@ import com.obdscanner.app.ui.theme.Danger
 import com.obdscanner.app.ui.theme.Ok
 import com.obdscanner.core.Dtc
 import com.obdscanner.core.DtcType
+import com.obdscanner.core.FreezeFrame
+import com.obdscanner.core.MonitorStatus
+import com.obdscanner.core.UnitSystem
+import com.obdscanner.core.Units
+import com.obdscanner.core.VehicleIdentity
 
 @Composable
 fun CodesScreen(state: UiState, viewModel: ObdViewModel, modifier: Modifier = Modifier) {
     val codes = state.codes
     var confirmClear by remember { mutableStateOf(false) }
+    val vehicle = VehicleIdentity.fromVin(state.vin).label
 
     LaunchedEffect(Unit) { if (!codes.loaded && !codes.loading) viewModel.readCodes() }
 
@@ -76,6 +85,8 @@ fun CodesScreen(state: UiState, viewModel: ObdViewModel, modifier: Modifier = Mo
             }
         }
 
+        codes.monitor?.takeIf { it.monitors.isNotEmpty() }?.let { monitor -> item { ReadinessCard(monitor) } }
+
         item {
             Row {
                 Button(onClick = viewModel::readCodes, enabled = !codes.loading) { Text("Read codes") }
@@ -97,8 +108,10 @@ fun CodesScreen(state: UiState, viewModel: ObdViewModel, modifier: Modifier = Mo
             val ofType = codes.codes.filter { it.type == type }
             if (ofType.isEmpty()) continue
             item(key = "h-$type") { SectionTitle("${type.label} (${ofType.size})") }
-            items(ofType, key = { "${it.type}-${it.code}" }) { DtcCard(it) }
+            items(ofType, key = { "${it.type}-${it.code}" }) { DtcCard(it, vehicle) }
         }
+
+        codes.freezeFrame?.let { frame -> item { FreezeFrameCard(frame, state.units) } }
 
         item {
             Hint(
@@ -128,11 +141,71 @@ fun CodesScreen(state: UiState, viewModel: ObdViewModel, modifier: Modifier = Mo
 }
 
 @Composable
-private fun DtcCard(dtc: Dtc) {
+private fun DtcCard(dtc: Dtc, vehicle: String?) {
+    val context = LocalContext.current
     Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp)) {
+        Column(Modifier.padding(start = 16.dp, top = 16.dp, end = 8.dp, bottom = 4.dp)) {
             Text(dtc.code, style = MaterialTheme.typography.titleLarge, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
             Text(dtc.description, style = MaterialTheme.typography.bodyMedium)
+            TextButton(onClick = {
+                val query = listOfNotNull(dtc.code, vehicle).joinToString(" ")
+                val uri = Uri.parse("https://www.google.com/search?q=" + Uri.encode(query))
+                runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, uri)) }
+            }) { Text(if (vehicle != null) "Search online for $vehicle" else "Search online") }
+        }
+    }
+}
+
+/** Emissions readiness: what a smog-check station looks at. */
+@Composable
+private fun ReadinessCard(monitor: MonitorStatus) {
+    val passes = monitor.likelyPassesInspection
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(
+                if (passes) "Smog check: likely ready" else "Smog check: not ready",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = if (passes) Ok else Danger,
+            )
+            val incomplete = monitor.incompleteMonitors.size
+            Hint(
+                when {
+                    monitor.milOn -> "The check-engine light is on, which fails an inspection in most states."
+                    incomplete == 0 -> "All readiness monitors have finished their self-tests."
+                    passes -> "One monitor hasn't finished; most states allow one (two for 1996–2000 cars)."
+                    else -> "$incomplete monitors haven't finished. Drive normally for a few days (highway and city) and check again."
+                },
+            )
+            monitor.monitors.forEach { m ->
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(m.name, style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        if (m.complete) "Ready" else "Not ready",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (m.complete) Ok else Danger,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** Engine conditions saved when the code was set: often the best clue to its cause. */
+@Composable
+private fun FreezeFrameCard(frame: FreezeFrame, units: UnitSystem) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("Freeze frame — ${frame.dtc}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Hint("What the engine was doing when this code was set.")
+            frame.values.forEach { (pid, value) ->
+                val shown = Units.display(pid, value, units)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(pid.name, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                    Text("${shown.text} ${shown.unit}", style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace)
+                }
+            }
         }
     }
 }

@@ -52,6 +52,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.obdscanner.app.ConnectionState
 import com.obdscanner.app.ObdViewModel
+import com.obdscanner.app.SavedAdapter
 import com.obdscanner.app.UiState
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -99,6 +100,18 @@ fun ConnectScreen(state: UiState, viewModel: ObdViewModel) {
                     }
                 }
                 else -> Unit
+            }
+
+            state.savedAdapter?.let { saved ->
+                if (!connecting) item {
+                    Button(onClick = {
+                        // Bluetooth adapters need the permission; Wi-Fi ones don't.
+                        if (saved.kind == SavedAdapter.Kind.WIFI || hasPermission) viewModel.reconnect()
+                        else permissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+                    }, modifier = Modifier.fillMaxWidth()) {
+                        Text("Reconnect to ${saved.name}")
+                    }
+                }
             }
 
             item { SectionTitle("Bluetooth adapter") }

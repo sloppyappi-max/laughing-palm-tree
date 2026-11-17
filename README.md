@@ -8,11 +8,15 @@ through a cheap ELM327 OBD-II adapter (Bluetooth or Wi-Fi).
 - **Connect** to a paired Bluetooth ELM327 (with fallbacks for picky clone adapters),
   a Bluetooth LE adapter (found by scanning), a Wi-Fi ELM327 (default `192.168.0.10:35000`), or a **demo car** to try the app with no hardware.
 - **Dashboard**: RPM and speed gauges plus every supported sensor the app can decode
-  (coolant, load, throttle, MAF, MAP, fuel trims, fuel level, voltage, oil temp…).
-  Only polls while the screen is visible; fast values refresh every round.
+  (coolant, load, throttle, MAF, MAP, fuel trims, fuel level, voltage, oil temp…), each with a
+  live trend graph. Only polls while the screen is visible; fast values refresh every round.
+- **Recording**: tap *Record* on the dashboard to log live data to CSV, then *Share log*.
 - **Trouble codes**: check-engine light status, stored / pending / permanent codes with
-  descriptions, and clearing codes (with a warning about readiness monitors).
-- **Vehicle**: VIN, protocol, battery voltage, adapter version, and a raw command terminal.
+  descriptions and a *Search online* button (uses the year and make from the VIN), the
+  **freeze frame** saved when the code was set, **smog-check readiness monitors**, and clearing codes.
+- **Vehicle**: year/make, VIN, protocol, battery voltage, adapter version, units setting
+  (US or metric), and a raw command terminal.
+- **Reconnect** to the last adapter with one tap.
 
 ## Project layout
 

@@ -43,13 +43,13 @@ class ObdClientTest {
 
     @Test
     fun readsAndClearsCodes() = runBlocking {
-        assertEquals(MonitorStatus(milOn = true, dtcCount = 2), client.monitorStatus())
+        client.monitorStatus()!!.let { assertTrue(it.milOn); assertEquals(2, it.dtcCount) }
         assertEquals(listOf("P0133", "P0420"), client.readDtcs(DtcType.STORED).map { it.code })
         assertEquals(listOf("P0301"), client.readDtcs(DtcType.PENDING).map { it.code })
         assertTrue(client.readDtcs(DtcType.PERMANENT).isEmpty())
         assertTrue(client.clearDtcs())
         assertTrue(client.readDtcs(DtcType.STORED).isEmpty())
-        assertEquals(MonitorStatus(milOn = false, dtcCount = 0), client.monitorStatus())
+        client.monitorStatus()!!.let { assertFalse(it.milOn); assertEquals(0, it.dtcCount) }
     }
 
     @Test

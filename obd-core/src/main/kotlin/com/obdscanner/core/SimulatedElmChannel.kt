@@ -17,6 +17,8 @@ class SimulatedElmChannel(
 ) : ElmChannel {
 
     private var stored = storedCodes
+    /** Clearing codes resets readiness monitors, like a real car. */
+    private var cleared = false
     private val startedAt = System.currentTimeMillis()
 
     private fun t() = (System.currentTimeMillis() - startedAt) / 1000.0
@@ -31,7 +33,7 @@ class SimulatedElmChannel(
         fun one(v: Double) = intArrayOf(v.roundToInt().coerceIn(0, 255))
         fun two(v: Double) = v.roundToInt().coerceIn(0, 65535).let { intArrayOf(it shr 8, it and 0xFF) }
         return when (pid) {
-            0x01 -> intArrayOf(if (stored.isEmpty()) 0x00 else 0x80 or stored.size, 0x07, 0xE5, 0x00)
+            0x01 -> intArrayOf(if (stored.isEmpty()) 0x00 else 0x80 or stored.size, 0x07, 0xE5, if (cleared) 0x25 else 0x00)
             0x04 -> one((15 + wave * 55) * 255 / 100)
             0x05 -> one(coolant + 40)
             0x06 -> one((100 + sin(t * 3) * 4) * 1.28)
@@ -104,7 +106,16 @@ class SimulatedElmChannel(
             cmd == "03" -> dtcResponse(0x03, stored)
             cmd == "07" -> dtcResponse(0x07, pendingCodes)
             cmd == "0A" -> dtcResponse(0x0A, emptyList())
-            cmd == "04" -> { stored = emptyList(); "44" }
+            cmd == "04" -> { stored = emptyList(); cleared = true; "44" }
+            cmd.length == 6 && cmd.startsWith("02") && cmd.endsWith("00") -> {
+                val pid = cmd.substring(2, 4).toIntOrNull(16)
+                when {
+                    pid == null -> "?"
+                    pid == 0x02 -> stored.firstOrNull()?.let { hex(0x42, 0x02, 0x00, *encodeDtc(it)) } ?: "4202000000"
+                    stored.isEmpty() -> "NO DATA"
+                    else -> pidBytes(pid)?.let { hex(0x42, pid, 0x00, *it) } ?: "NO DATA"
+                }
+            }
             cmd == "0902" -> canMessage(intArrayOf(0x49, 0x02, 0x01) + vin.map { it.code }.toIntArray())
             cmd.length == 4 && cmd.startsWith("01") -> {
                 val pid = cmd.substring(2).toIntOrNull(16)

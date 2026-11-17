@@ -78,16 +78,40 @@ class ObdClient(private val channel: ElmChannel) {
     }
 
     suspend fun monitorStatus(): MonitorStatus? {
-        val msgs = (query(0x01, 0x01) as? ObdResponse.Data)?.matching(0x01, 0x01) ?: return null
-        // Several ECUs may answer; combine them.
-        var mil = false
-        var count = 0
-        for (m in msgs) {
-            if (m.size < 3) continue
-            mil = mil || (m.u(2) and 0x80) != 0
-            count += m.u(2) and 0x7F
+        val msgs = (query(0x01, 0x01) as? ObdResponse.Data)?.matching(0x01, 0x01)
+            ?.filter { it.size >= 6 } ?: return null
+        if (msgs.isEmpty()) return null
+        // Several ECUs may answer: the MIL is on if any says so and codes add up, but readiness
+        // comes from the engine computer, which reports the most monitors.
+        val decoded = msgs.map { MonitorStatus.decode(it.u(2), it.u(3), it.u(4), it.u(5)) }
+        return decoded.maxBy { it.monitors.size }.copy(
+            milOn = decoded.any { it.milOn },
+            dtcCount = decoded.sumOf { it.dtcCount },
+        )
+    }
+
+    /**
+     * Mode 02: the snapshot the engine computer saved when the first code was set.
+     * Null when no freeze frame is stored.
+     */
+    suspend fun readFreezeFrame(pids: List<Pid> = FreezeFrame.DEFAULT_PIDS): FreezeFrame? {
+        val trigger = freezeFrameData(0x02)?.takeIf { it.size >= 2 && (it[0] != 0 || it[1] != 0) } ?: return null
+        val values = LinkedHashMap<Pid, Double>()
+        for (pid in pids) {
+            val data = freezeFrameData(pid.code) ?: continue
+            runCatching { pid.decode(data) }.getOrNull()?.let { values[pid] = it }
         }
-        return MonitorStatus(mil, count)
+        return FreezeFrame(Dtc.decode(trigger[0], trigger[1]), values)
+    }
+
+    /** Data bytes of `02 <pid> 00` (frame 0), or null. */
+    private suspend fun freezeFrameData(pid: Int): IntArray? {
+        val command = "02%02X00".format(pid)
+        val response = ElmResponseParser.parse(channel.exchange(command), command) as? ObdResponse.Data ?: return null
+        val m = response.matching(0x02, pid).firstOrNull() ?: return null
+        // 42 <pid> <frame> data...  (some ECUs omit the frame byte)
+        val start = if (m.size >= 4) 3 else 2
+        return IntArray(m.size - start) { m.u(it + start) }
     }
 
     suspend fun readDtcs(type: DtcType): List<Dtc> {
@@ -114,6 +138,16 @@ class ObdClient(private val channel: ElmChannel) {
     private suspend fun at(command: String): String? =
         ElmResponseParser.lines(channel.exchange(command), command).firstOrNull()
             ?.takeUnless { it == "?" }
+}
+
+/** The conditions recorded when [dtc] was set. */
+data class FreezeFrame(val dtc: String, val values: Map<Pid, Double>) {
+    companion object {
+        val DEFAULT_PIDS = listOf(
+            Pids.RPM, Pids.SPEED, Pids.COOLANT_TEMP, Pids.ENGINE_LOAD, Pids.THROTTLE, Pids.INTAKE_TEMP,
+            Pids.INTAKE_MAP, Pids.MAF, Pids.STFT_B1, Pids.LTFT_B1, Pids.STFT_B2, Pids.LTFT_B2,
+        )
+    }
 }
 
 object Vin {

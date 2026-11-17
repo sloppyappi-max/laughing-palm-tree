@@ -16,6 +16,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -23,6 +24,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
@@ -31,6 +33,8 @@ import androidx.compose.ui.unit.dp
 import com.obdscanner.app.ConnectionState
 import com.obdscanner.app.ObdViewModel
 import com.obdscanner.app.UiState
+import com.obdscanner.core.UnitSystem
+import com.obdscanner.core.VehicleIdentity
 
 @Composable
 fun VehicleScreen(
@@ -50,6 +54,7 @@ fun VehicleScreen(
         item {
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    VehicleIdentity.fromVin(state.vin).label?.let { InfoRow("Vehicle", it) }
                     InfoRow("VIN", if (state.vinLoading) "Reading…" else state.vin ?: "Not reported")
                     InfoRow("Protocol", info.protocol ?: "—")
                     InfoRow("Battery", state.batteryVoltage?.let { "%.1f V".format(it) } ?: "—")
@@ -63,6 +68,25 @@ fun VehicleScreen(
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 OutlinedButton(onClick = viewModel::readVehicleInfo) { Text("Refresh") }
                 Button(onClick = viewModel::disconnect) { Text("Disconnect") }
+            }
+        }
+
+        item { SectionTitle("Settings") }
+        item {
+            Card(Modifier.fillMaxWidth()) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("US units")
+                        Hint(if (state.units == UnitSystem.IMPERIAL) "°F, mph, psi, miles" else "°C, km/h, kPa, km")
+                    }
+                    Switch(
+                        checked = state.units == UnitSystem.IMPERIAL,
+                        onCheckedChange = { viewModel.setUnits(if (it) UnitSystem.IMPERIAL else UnitSystem.METRIC) },
+                    )
+                }
             }
         }
 

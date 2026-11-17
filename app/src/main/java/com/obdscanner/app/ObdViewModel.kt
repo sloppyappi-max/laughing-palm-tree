@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Application
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
+import android.content.Context
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
@@ -15,6 +16,8 @@ import com.obdscanner.app.transport.BleLog
 import com.obdscanner.app.transport.Transports
 import com.obdscanner.core.AdapterInfo
 import com.obdscanner.core.Dtc
+import com.obdscanner.core.FreezeFrame
+import com.obdscanner.core.UnitSystem
 import com.obdscanner.core.DtcType
 import com.obdscanner.core.ElmChannel
 import com.obdscanner.core.ElmTimeoutException
@@ -32,6 +35,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
+import java.io.BufferedWriter
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 sealed interface ConnectionState {
     data object Disconnected : ConnectionState
@@ -44,11 +54,17 @@ data class PairedDevice(val name: String, val address: String)
 
 data class BleDevice(val name: String, val address: String, val rssi: Int)
 
+/** The last adapter that connected successfully, for one-tap reconnect. */
+data class SavedAdapter(val kind: Kind, val name: String, val address: String, val port: Int = 0) {
+    enum class Kind { BLUETOOTH, BLE, WIFI }
+}
+
 data class CodesState(
     val loading: Boolean = false,
     val loaded: Boolean = false,
     val monitor: MonitorStatus? = null,
     val codes: List<Dtc> = emptyList(),
+    val freezeFrame: FreezeFrame? = null,
     val message: String? = null,
 )
 
@@ -69,11 +85,28 @@ data class UiState(
     val bleMessage: String? = null,
     /** Bluetooth LE link report shown after a failed connection, for investigating unknown adapters. */
     val diagnostics: String? = null,
+    val units: UnitSystem = UnitSystem.METRIC,
+    /** Recent samples per PID (metric), oldest first, for the dashboard graphs. */
+    val history: Map<Int, List<Float>> = emptyMap(),
+    val recording: Boolean = false,
+    val recordedRows: Int = 0,
+    val lastRecording: File? = null,
+    val savedAdapter: SavedAdapter? = null,
 )
+
+private const val HISTORY_SIZE = 90
 
 class ObdViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val _state = MutableStateFlow(UiState())
+    private val prefs = app.getSharedPreferences("settings", Context.MODE_PRIVATE)
+
+    private val _state = MutableStateFlow(
+        UiState(
+            units = prefs.getString("units", null)?.let { runCatching { UnitSystem.valueOf(it) }.getOrNull() }
+                ?: if (Locale.getDefault().country in setOf("US", "LR", "MM")) UnitSystem.IMPERIAL else UnitSystem.METRIC,
+            savedAdapter = loadSavedAdapter(),
+        ),
+    )
     val state: StateFlow<UiState> = _state.asStateFlow()
 
     private val bluetooth: BluetoothAdapter? =
@@ -105,7 +138,44 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     fun connectBluetooth(device: PairedDevice) {
         val adapter = bluetooth ?: return
         val remote = adapter.getRemoteDevice(device.address)
-        connect(AdapterTarget.Bluetooth(remote, device.name)) { Transports.bluetooth(remote) }
+        val saved = SavedAdapter(SavedAdapter.Kind.BLUETOOTH, device.name, device.address)
+        connect(AdapterTarget.Bluetooth(remote, device.name), saved) { Transports.bluetooth(remote) }
+    }
+
+    fun setUnits(units: UnitSystem) {
+        prefs.edit().putString("units", units.name).apply()
+        _state.update { it.copy(units = units) }
+    }
+
+    /** Connects to the adapter that worked last time. */
+    fun reconnect() {
+        val saved = _state.value.savedAdapter ?: return
+        when (saved.kind) {
+            SavedAdapter.Kind.BLUETOOTH -> connectBluetooth(PairedDevice(saved.name, saved.address))
+            SavedAdapter.Kind.BLE -> connectBle(BleDevice(saved.name, saved.address, 0))
+            SavedAdapter.Kind.WIFI -> connectWifi(saved.address, saved.port)
+        }
+    }
+
+    private fun loadSavedAdapter(): SavedAdapter? {
+        val kind = prefs.getString("adapter_kind", null)?.let { runCatching { SavedAdapter.Kind.valueOf(it) }.getOrNull() }
+            ?: return null
+        return SavedAdapter(
+            kind,
+            prefs.getString("adapter_name", null) ?: return null,
+            prefs.getString("adapter_address", null) ?: return null,
+            prefs.getInt("adapter_port", 0),
+        )
+    }
+
+    private fun saveAdapter(saved: SavedAdapter) {
+        prefs.edit()
+            .putString("adapter_kind", saved.kind.name)
+            .putString("adapter_name", saved.name)
+            .putString("adapter_address", saved.address)
+            .putInt("adapter_port", saved.port)
+            .apply()
+        _state.update { it.copy(savedAdapter = saved) }
     }
 
     private var scanCallback: ScanCallback? = null
@@ -163,19 +233,25 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         stopBleScan()
         val remote = adapter.getRemoteDevice(device.address)
         val log = BleLog()
-        connect(AdapterTarget.Ble(remote, device.name), diagnostics = log::text) {
+        val saved = SavedAdapter(SavedAdapter.Kind.BLE, device.name, device.address)
+        connect(AdapterTarget.Ble(remote, device.name), saved, diagnostics = log::text) {
             BleElmChannel.connect(getApplication<Application>(), remote, log)
         }
     }
 
     fun connectWifi(host: String, port: Int) {
         val target = AdapterTarget.Wifi(host, port)
-        connect(target) { Transports.wifi(target) }
+        connect(target, SavedAdapter(SavedAdapter.Kind.WIFI, target.label, host, port)) { Transports.wifi(target) }
     }
 
-    fun connectDemo() = connect(AdapterTarget.Demo) { SimulatedElmChannel() }
+    fun connectDemo() = connect(AdapterTarget.Demo, saved = null) { SimulatedElmChannel() }
 
-    private fun connect(target: AdapterTarget, diagnostics: (() -> String)? = null, open: suspend () -> ElmChannel) {
+    private fun connect(
+        target: AdapterTarget,
+        saved: SavedAdapter?,
+        diagnostics: (() -> String)? = null,
+        open: suspend () -> ElmChannel,
+    ) {
         disconnect()
         connectJob = viewModelScope.launch {
             try {
@@ -187,13 +263,17 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                 val info = obd.initialize()
                 client = obd
                 val supported = if (info.vehicleResponding) obd.supportedPids() else emptySet()
+                // The VIN tells us the year and make, used to search trouble codes online.
+                val vin = if (info.vehicleResponding) runCatching { obd.readVin() }.getOrNull() else null
                 _state.update {
                     it.copy(
                         connection = ConnectionState.Connected(target, info),
                         supportedPids = supported,
+                        vin = vin,
                         batteryVoltage = info.batteryVoltage,
                     )
                 }
+                saved?.let(::saveAdapter)
                 if (liveActive) startPolling()
             } catch (e: CancellationException) {
                 throw e
@@ -212,13 +292,21 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     fun disconnect() {
         connectJob?.cancel()
         pollJob?.cancel()
+        stopRecording()
         closeChannel()
+        // Forget everything about the car; keep settings and device lists.
         _state.update {
-            UiState(
-                pairedDevices = it.pairedDevices,
-                bluetoothAvailable = it.bluetoothAvailable,
-                bluetoothEnabled = it.bluetoothEnabled,
-                bleDevices = it.bleDevices,
+            it.copy(
+                connection = ConnectionState.Disconnected,
+                supportedPids = emptySet(),
+                live = emptyMap(),
+                history = emptyMap(),
+                codes = CodesState(),
+                vin = null,
+                vinLoading = false,
+                batteryVoltage = null,
+                terminal = emptyList(),
+                diagnostics = null,
             )
         }
     }
@@ -231,6 +319,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun lostConnection(e: Exception) {
         pollJob?.cancel()
+        stopRecording()
         closeChannel()
         _state.update { it.copy(connection = ConnectionState.Failed("Connection lost: ${e.message}")) }
     }
@@ -264,7 +353,12 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                     try {
                         val value = obd.read(pid)
                         timeouts = 0
-                        if (value != null) _state.update { it.copy(live = it.live + (pid.code to value)) }
+                        if (value != null) {
+                            _state.update {
+                                val samples = (it.history[pid.code].orEmpty() + value.toFloat()).takeLast(HISTORY_SIZE)
+                                it.copy(live = it.live + (pid.code to value), history = it.history + (pid.code to samples))
+                            }
+                        }
                     } catch (e: ElmTimeoutException) {
                         if (++timeouts >= 3) return@launch lostConnection(e)
                     } catch (e: CancellationException) {
@@ -273,6 +367,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                         return@launch lostConnection(e)
                     }
                 }
+                writeRecordingRow()
                 if (fast.isEmpty() && slow.size <= 1) delay(500)
             }
         }
@@ -285,7 +380,8 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val monitor = obd.monitorStatus()
                 val codes = DtcType.entries.flatMap { obd.readDtcs(it) }
-                _state.update { it.copy(codes = CodesState(loaded = true, monitor = monitor, codes = codes)) }
+                val freezeFrame = if (codes.isNotEmpty()) runCatching { obd.readFreezeFrame() }.getOrNull() else null
+                _state.update { it.copy(codes = CodesState(loaded = true, monitor = monitor, codes = codes, freezeFrame = freezeFrame)) }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -333,7 +429,47 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // --- Recording live data to CSV ---
+
+    private var recordWriter: BufferedWriter? = null
+    private var recordPids: List<Pid> = emptyList()
+    private var recordStart = 0L
+
+    /** Starts writing every polling round to a CSV file (metric units) in the app's cache. */
+    fun startRecording() {
+        if (recordWriter != null || client == null) return
+        val pids = dashboardPids(_state.value).takeIf { it.isNotEmpty() } ?: return
+        val dir = File(getApplication<Application>().cacheDir, "logs").apply { mkdirs() }
+        val file = File(dir, "obd-${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())}.csv")
+        val writer = runCatching { file.bufferedWriter() }.getOrNull() ?: return
+        writer.write((listOf("time_s") + pids.map { "${it.name} (${it.unit})" }).joinToString(",") { "\"$it\"" })
+        writer.newLine()
+        recordWriter = writer
+        recordPids = pids
+        recordStart = System.currentTimeMillis()
+        _state.update { it.copy(recording = true, recordedRows = 0, lastRecording = file) }
+    }
+
+    fun stopRecording() {
+        val writer = recordWriter ?: return
+        recordWriter = null
+        runCatching { writer.close() }
+        _state.update { it.copy(recording = false) }
+    }
+
+    private suspend fun writeRecordingRow() {
+        val writer = recordWriter ?: return
+        val live = _state.value.live
+        val elapsed = (System.currentTimeMillis() - recordStart) / 1000.0
+        val row = (listOf(String.format(Locale.US, "%.2f", elapsed)) +
+            recordPids.map { pid -> live[pid.code]?.let { String.format(Locale.US, "%.${pid.decimals + 1}f", it) } ?: "" })
+            .joinToString(",")
+        val ok = withContext(Dispatchers.IO) { runCatching { writer.write(row); writer.newLine() }.isSuccess }
+        if (ok) _state.update { it.copy(recordedRows = it.recordedRows + 1) } else stopRecording()
+    }
+
     override fun onCleared() {
+        stopRecording()
         stopBleScan()
         closeChannel()
     }

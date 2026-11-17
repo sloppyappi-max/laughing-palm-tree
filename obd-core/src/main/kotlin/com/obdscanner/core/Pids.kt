@@ -57,5 +57,48 @@ object Pids {
     fun byCode(code: Int): Pid? = byCode[code]
 }
 
-/** Decoded PID 01 01: check-engine light and how many codes are stored. */
-data class MonitorStatus(val milOn: Boolean, val dtcCount: Int)
+/** One emissions readiness monitor from PID 01 01 (what an inspection station checks). */
+data class ReadinessMonitor(val name: String, val complete: Boolean)
+
+/** Decoded PID 01 01: check-engine light, how many codes are stored, and readiness monitors. */
+data class MonitorStatus(
+    val milOn: Boolean,
+    val dtcCount: Int,
+    val monitors: List<ReadinessMonitor> = emptyList(),
+    val compressionIgnition: Boolean = false,
+) {
+    val incompleteMonitors: List<ReadinessMonitor> get() = monitors.filterNot { it.complete }
+
+    /**
+     * Rough smog-check verdict: most US states fail a car with the MIL on, and allow at most one
+     * incomplete monitor (model year 2001+). Local rules vary.
+     */
+    val likelyPassesInspection: Boolean get() = !milOn && incompleteMonitors.size <= 1
+
+    companion object {
+        private val CONTINUOUS = listOf("Misfire", "Fuel system", "Comprehensive components")
+        private val SPARK = listOf(
+            "Catalyst", "Heated catalyst", "Evaporative system", "Secondary air system",
+            "A/C refrigerant", "Oxygen sensor", "Oxygen sensor heater", "EGR system",
+        )
+        private val COMPRESSION = listOf(
+            "NMHC catalyst", "NOx/SCR aftertreatment", null, "Boost pressure",
+            null, "Exhaust gas sensor", "Particulate filter", "EGR/VVT system",
+        )
+
+        /** Decodes the four data bytes A B C D of PID 01 01. */
+        fun decode(a: Int, b: Int, c: Int, d: Int): MonitorStatus {
+            val diesel = (b and 0x08) != 0
+            val monitors = mutableListOf<ReadinessMonitor>()
+            CONTINUOUS.forEachIndexed { bit, name ->
+                // Availability in B bits 0-2, incompleteness in B bits 4-6.
+                if ((b shr bit) and 1 == 1) monitors += ReadinessMonitor(name, (b shr (bit + 4)) and 1 == 0)
+            }
+            (if (diesel) COMPRESSION else SPARK).forEachIndexed { bit, name ->
+                // Availability in C, incompleteness in D.
+                if (name != null && (c shr bit) and 1 == 1) monitors += ReadinessMonitor(name, (d shr bit) and 1 == 0)
+            }
+            return MonitorStatus((a and 0x80) != 0, a and 0x7F, monitors, diesel)
+        }
+    }
+}

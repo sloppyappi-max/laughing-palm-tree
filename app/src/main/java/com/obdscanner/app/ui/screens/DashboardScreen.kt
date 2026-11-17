@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
@@ -22,6 +23,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalView
@@ -33,6 +35,8 @@ import com.obdscanner.app.ObdViewModel
 import com.obdscanner.app.UiState
 import com.obdscanner.core.Pid
 import com.obdscanner.core.Pids
+import com.obdscanner.core.UnitSystem
+import com.obdscanner.core.Units
 
 @Composable
 fun DashboardScreen(
@@ -74,20 +78,22 @@ fun DashboardScreen(
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        items(gauges, key = { "g${it.code}" }) { pid -> Gauge(pid, state.live[pid.code]) }
+        items(gauges, key = { "g${it.code}" }) { pid -> Gauge(pid, state.live[pid.code], state.units) }
         if (pids.isEmpty()) {
             item(span = { GridItemSpan(maxLineSpan) }) { Hint("This car reports no live data the app knows how to show.") }
         }
-        items(tiles, key = { it.code }) { pid -> ValueTile(pid, state.live[pid.code]) }
+        items(tiles, key = { it.code }) { pid ->
+            ValueTile(pid, state.live[pid.code], state.units, state.history[pid.code].orEmpty())
+        }
     }
 }
 
 @Composable
-private fun Gauge(pid: Pid, value: Double?) {
+private fun Gauge(pid: Pid, value: Double?, units: UnitSystem) {
     val track = MaterialTheme.colorScheme.surfaceVariant
     val fill = MaterialTheme.colorScheme.primary
-    val max = if (pid == Pids.RPM) 7000.0 else 200.0
-    val fraction = ((value ?: 0.0) / max).coerceIn(0.0, 1.0).toFloat()
+    val shown = value?.let { Units.display(pid, it, units) }
+    val fraction = ((shown?.value ?: 0.0) / Units.gaugeMax(pid, units)).coerceIn(0.0, 1.0).toFloat()
     Card {
         Box(Modifier.fillMaxWidth().aspectRatio(1f).padding(16.dp), contentAlignment = Alignment.Center) {
             Canvas(Modifier.fillMaxSize()) {
@@ -99,26 +105,46 @@ private fun Gauge(pid: Pid, value: Double?) {
             }
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(
-                    value?.let(pid::format) ?: "—",
+                    shown?.text ?: "—",
                     style = MaterialTheme.typography.headlineLarge,
                     fontWeight = FontWeight.Bold,
                 )
-                Text(pid.unit, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(Units.display(pid, 0.0, units).unit, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
 }
 
 @Composable
-private fun ValueTile(pid: Pid, value: Double?) {
+private fun ValueTile(pid: Pid, value: Double?, units: UnitSystem, history: List<Float>) {
     Card {
         Column(Modifier.fillMaxWidth().padding(16.dp)) {
             Text(pid.shortName, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text(
-                value?.let { "${pid.format(it)} ${pid.unit}" } ?: "—",
+                value?.let { Units.display(pid, it, units).let { d -> "${d.text} ${d.unit}" } } ?: "—",
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.SemiBold,
             )
+            Sparkline(history, Modifier.fillMaxWidth().height(32.dp).padding(top = 6.dp))
         }
+    }
+}
+
+/** A small trend line of recent samples, scaled to their own min/max. */
+@Composable
+private fun Sparkline(samples: List<Float>, modifier: Modifier = Modifier) {
+    val color = MaterialTheme.colorScheme.primary
+    Canvas(modifier) {
+        if (samples.size < 2) return@Canvas
+        val min = samples.min()
+        val range = (samples.max() - min).takeIf { it > 0f } ?: 1f
+        val stepX = size.width / (samples.size - 1)
+        val path = Path()
+        samples.forEachIndexed { i, v ->
+            val x = i * stepX
+            val y = size.height - (v - min) / range * size.height
+            if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+        }
+        drawPath(path, color, style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round))
     }
 }
