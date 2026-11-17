@@ -187,6 +187,9 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         app.getSystemService(BluetoothManager::class.java)?.adapter
 
     private var channel: ElmChannel? = null
+
+    /** Bluetooth LE link log of the current connection (services, characteristics, first traffic). */
+    private var bleLog: BleLog? = null
     private var client: ObdClient? = null
     private var connectJob: Job? = null
     private var pollJob: Job? = null
@@ -419,7 +422,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         val log = BleLog()
         val saved = SavedAdapter(SavedAdapter.Kind.BLE, device.name, device.address)
         connect(AdapterTarget.Ble(remote, device.name), saved, diagnostics = log::text) {
-            BleElmChannel.connect(getApplication<Application>(), remote, log)
+            BleElmChannel.connect(getApplication<Application>(), remote, log).also { bleLog = log }
         }
     }
 
@@ -531,6 +534,8 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
             val header = listOfNotNull(
                 "OBD Scanner adapter test",
                 info?.probeResponse?.let { "Detection:\n$it" },
+                // Brand dongles may offer extra Bluetooth services their own app uses.
+                bleLog?.text()?.let { "Bluetooth LE link:\n$it" },
             ).joinToString("\n\n")
             _state.update { it.copy(adapterTestRunning = false, adapterReport = "$header\n\n$report") }
         }
@@ -570,6 +575,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     private fun closeChannel() {
         runCatching { channel?.close() }
         channel = null
+        bleLog = null
         client = null
     }
 
