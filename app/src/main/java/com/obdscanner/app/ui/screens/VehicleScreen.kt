@@ -27,6 +27,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
@@ -101,9 +102,10 @@ fun VehicleScreen(
 
 @Composable
 private fun InfoRow(label: String, value: String) {
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(value, fontFamily = FontFamily.Monospace)
+        // Long values (calibration IDs) wrap on the right instead of squeezing the label.
+        Text(value, fontFamily = FontFamily.Monospace, textAlign = TextAlign.End, modifier = Modifier.weight(1f))
     }
 }
 

@@ -14,7 +14,13 @@ class SimulatedElmChannel(
     storedCodes: List<String> = listOf("P0133", "P0420"),
     private val pendingCodes: List<String> = listOf("P0301"),
     private val vin: String = "1HGCM82633A004352",
+    /** What ATDP reports. Anything without "CAN 11/" simulates a car without module access. */
+    private val protocol: String = "ISO 15765-4 (CAN 11/500)",
 ) : ElmChannel {
+
+    /** Every command received, for tests. */
+    val sent: MutableList<String> = mutableListOf()
+    private val can11 get() = protocol.contains("CAN 11/")
 
     private var stored = storedCodes
     /** Clearing codes resets readiness monitors, like a real car. */
@@ -170,17 +176,23 @@ class SimulatedElmChannel(
     override suspend fun exchange(command: String, timeoutMs: Long): String {
         delay(latencyMs)
         val cmd = command.uppercase().replace(" ", "")
+        sent += cmd
+        // On an older car, a 3-digit ATSH header makes every request go nowhere.
+        if (!can11 && target != "7DF" && !cmd.startsWith("AT")) return "NO DATA\r\r"
         val body = when {
             cmd == "ATZ" -> "\r\rELM327 v1.5"
             cmd == "ATRV" -> "12.6V"
-            cmd == "ATDP" -> "AUTO, ISO 15765-4 (CAN 11/500)"
-            cmd == "ATDPN" -> "A6"
+            cmd == "ATDP" -> "AUTO, $protocol"
+            cmd == "ATDPN" -> if (can11) "A6" else "A3"
             cmd == "ATI" -> "ELM327 v1.5"
             cmd == "ATH1" -> { headers = true; "OK" }
             cmd == "ATH0" -> { headers = false; "OK" }
             cmd.startsWith("ATSH") -> { target = cmd.removePrefix("ATSH"); "OK" }
             !cmd.startsWith("AT") && target != "7DF" -> moduleResponse(target, cmd)
-            headers && cmd == "0100" -> "7E806" + hex(0x41, 0x00, *supportMask(0x00)) + "\r7E906" + hex(0x41, 0x00, 0x80, 0, 0, 0)
+            headers && cmd == "0100" && can11 -> "7E806" + hex(0x41, 0x00, *supportMask(0x00)) + "\r7E906" + hex(0x41, 0x00, 0x80, 0, 0, 0)
+            headers && cmd == "0100" -> "486B10" + hex(0x41, 0x00, *supportMask(0x00)) + "00"
+            // With headers on, normal answers carry the sender's ID, which breaks header-less parsing.
+            headers && cmd.length == 4 && cmd.startsWith("01") -> "7E804" + (pidBytes(cmd.substring(2).toInt(16))?.let { hex(0x41, cmd.substring(2).toInt(16), *it) } ?: "")
             cmd.startsWith("AT") -> "OK"
             cmd == "03" -> dtcResponse(0x03, stored)
             cmd == "07" -> dtcResponse(0x07, pendingCodes)

@@ -40,7 +40,6 @@ android {
         // Report everything in the CI log; don't fail the build on warnings.
         abortOnError = false
         textReport = true
-        textOutput = file("stdout")
         checkReleaseBuilds = false
     }
 }

@@ -35,7 +35,11 @@ import com.obdscanner.core.Pid
 import com.obdscanner.core.Pids
 import com.obdscanner.core.SimulatedElmChannel
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -184,6 +188,21 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     private var pollJob: Job? = null
     private var liveActive = false
 
+    /**
+     * Parent of all work for the current connection (connecting, polling, reading codes, scans…).
+     * Cancelled on disconnect so a request still in flight can't update the screen afterwards.
+     */
+    private var connectionJob = SupervisorJob(viewModelScope.coroutineContext[Job])
+
+    private fun launchForConnection(block: suspend CoroutineScope.() -> Unit): Job =
+        viewModelScope.launch(connectionJob, block = block)
+
+    private fun resetConnectionJobs() {
+        val old = connectionJob
+        connectionJob = SupervisorJob(viewModelScope.coroutineContext[Job])
+        old.cancel()
+    }
+
     /** Call once Bluetooth permission is granted (or on Android < 12). */
     @SuppressLint("MissingPermission")
     fun refreshPairedDevices() {
@@ -247,8 +266,9 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         val obd = client ?: return onResult("Connect to the car first.")
         if (!obd.supportsModuleAccess) return onResult("This car's protocol doesn't support module requests.")
         val pid = runCatching { sensor.toPid() }.getOrElse { return onResult(it.message ?: "Invalid sensor") }
-        viewModelScope.launch {
+        launchForConnection {
             val value = runCatching { obd.read(pid) }.getOrNull()
+            ensureActive()
             onResult(
                 if (value == null) "No answer. Check the module address and command."
                 else "Reads ${Units.display(pid, value, _state.value.units).let { "${it.text} ${it.unit}" }}",
@@ -261,7 +281,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     fun scanModules(full: Boolean) {
         val obd = client ?: return
         if (_state.value.scan.running) return
-        viewModelScope.launch {
+        launchForConnection {
             _state.update { it.copy(scan = ScanState(running = true, full = full)) }
             val result = runCatching {
                 obd.scanModules(full) { p -> _state.update { it.copy(scan = it.scan.copy(progress = p)) } }
@@ -269,6 +289,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                 if (e is CancellationException) throw e
                 SystemScan(emptyList(), "Scan failed: ${e.message}")
             }
+            ensureActive()
             _state.update { it.copy(scan = ScanState(result = result, full = full)) }
         }
     }
@@ -277,11 +298,12 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         val obd = client ?: return
         val id = header.toIntOrNull(16) ?: return
         if (_state.value.explorer.running) return
-        viewModelScope.launch {
+        launchForConnection {
             _state.update { it.copy(explorer = ExplorerState(running = true, header = header)) }
             val found = runCatching {
                 obd.exploreDids(id, from, to) { p -> _state.update { it.copy(explorer = it.explorer.copy(progress = p)) } }
             }.getOrElse { e -> if (e is CancellationException) throw e; emptyMap() }
+            ensureActive()
             _state.update { it.copy(explorer = ExplorerState(results = found, header = header)) }
         }
     }
@@ -410,10 +432,16 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         open: suspend () -> ElmChannel,
     ) {
         disconnect()
-        connectJob = viewModelScope.launch {
+        connectJob = launchForConnection {
             try {
                 _state.update { it.copy(connection = ConnectionState.Connecting(target, "Opening connection…")) }
-                val ch = open()
+                // Socket connects can't be interrupted; let it finish, then close it if the user cancelled
+                // meanwhile, so the adapter isn't left busy.
+                val ch = withContext(NonCancellable) { open() }
+                if (!isActive) {
+                    runCatching { ch.close() }
+                    return@launchForConnection
+                }
                 channel = ch
                 val obd = ObdClient(ch)
                 _state.update { it.copy(connection = ConnectionState.Connecting(target, "Initializing adapter…")) }
@@ -424,6 +452,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                 val vin = if (info.vehicleResponding) runCatching { obd.readVin() }.getOrNull() else null
                 // Check-engine light status for the status line under every screen title.
                 val monitor = if (info.vehicleResponding) runCatching { obd.monitorStatus() }.getOrNull() else null
+                ensureActive()
                 _state.update {
                     it.copy(
                         connection = ConnectionState.Connected(target, info),
@@ -439,6 +468,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                if (!isActive) return@launchForConnection // cancelled: the user already moved on
                 closeChannel()
                 _state.update {
                     it.copy(
@@ -451,8 +481,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun disconnect() {
-        connectJob?.cancel()
-        pollJob?.cancel()
+        resetConnectionJobs()
         stopRecording()
         closeChannel()
         trip.reset()
@@ -486,10 +515,11 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun lostConnection(e: Exception) {
-        pollJob?.cancel()
         stopRecording()
         closeChannel()
+        trip.reset()
         _state.update { it.copy(connection = ConnectionState.Failed("Connection lost: ${e.message}")) }
+        resetConnectionJobs() // also ends the polling loop that called this
     }
 
     /** The dashboard calls this when it becomes visible / hidden, so we only poll while someone is looking. */
@@ -543,7 +573,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     /** Mode 06 self-test results. */
     fun runMonitorTests() {
         val obd = client ?: return
-        viewModelScope.launch {
+        launchForConnection {
             _state.update { it.copy(monitorTests = it.monitorTests.copy(loading = true, message = null)) }
             try {
                 val tests = obd.readMonitorTests()
@@ -567,7 +597,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     private fun startPolling() {
         val obd = client ?: return
         if (pollJob?.isActive == true) return
-        pollJob = viewModelScope.launch {
+        pollJob = launchForConnection {
             // Refresh fast-changing values every round, and one slower value per round.
             // The list is re-read every round so favorites / "All sensors" apply immediately.
             val fastCodes = setOf(Pids.RPM.code, Pids.SPEED.code, Pids.THROTTLE.code, Pids.ENGINE_LOAD.code, Pids.MAF.code)
@@ -590,11 +620,14 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                             }
                         }
                     } catch (e: ElmTimeoutException) {
-                        if (++timeouts >= 3) return@launch lostConnection(e)
+                        if (!isActive) return@launchForConnection
+                        if (++timeouts >= 3) return@launchForConnection lostConnection(e)
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
-                        return@launch lostConnection(e)
+                        // Closing the channel on disconnect makes a pending read fail; that isn't a lost connection.
+                        if (!isActive) return@launchForConnection
+                        return@launchForConnection lostConnection(e)
                     }
                 }
                 val live = _state.value.live
@@ -608,7 +641,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
 
     fun readCodes() {
         val obd = client ?: return
-        viewModelScope.launch {
+        launchForConnection {
             _state.update { it.copy(codes = it.codes.copy(loading = true, message = null)) }
             try {
                 val monitor = obd.monitorStatus()
@@ -625,9 +658,10 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
 
     fun clearCodes() {
         val obd = client ?: return
-        viewModelScope.launch {
+        launchForConnection {
             _state.update { it.copy(codes = it.codes.copy(loading = true, message = null)) }
             val ok = runCatching { obd.clearDtcs() }.getOrDefault(false)
+            ensureActive()
             _state.update {
                 it.copy(
                     codes = it.codes.copy(
@@ -642,17 +676,18 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
 
     fun readVehicleInfo() {
         val obd = client ?: return
-        viewModelScope.launch {
+        launchForConnection {
             _state.update { it.copy(vinLoading = true) }
             val info = runCatching { obd.readVehicleInfo() }.getOrNull()
             val voltage = runCatching { obd.batteryVoltage() }.getOrNull()
+            ensureActive()
             _state.update {
                 it.copy(
                     vin = info?.vin ?: it.vin,
                     vehicleInfo = info,
                     vinLoading = false,
                     batteryVoltage = voltage ?: it.batteryVoltage,
-                )
+                ).let { s -> s.copy(customPids = buildCustomPids(s)) } // GM sensors depend on the VIN
             }
         }
     }
@@ -662,9 +697,10 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         val obd = client ?: return
         val cmd = command.trim().uppercase()
         if (cmd.isEmpty()) return
-        viewModelScope.launch {
+        launchForConnection {
             val reply = runCatching { obd.raw(cmd).joinToString("\n").ifEmpty { "(empty)" } }
                 .getOrElse { "Error: ${it.message}" }
+            ensureActive()
             _state.update { it.copy(terminal = (it.terminal + "> $cmd" + reply).takeLast(200)) }
         }
     }

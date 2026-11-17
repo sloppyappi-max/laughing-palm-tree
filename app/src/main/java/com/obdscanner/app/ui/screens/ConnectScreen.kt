@@ -2,6 +2,8 @@ package com.obdscanner.app.ui.screens
 
 import android.Manifest
 import android.content.Intent
+import android.net.Uri
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import android.content.pm.PackageManager
 import android.os.Build
 import android.provider.Settings as AndroidSettings
@@ -69,11 +71,18 @@ fun ConnectScreen(state: UiState, viewModel: ObdViewModel, onOpenSettings: () ->
         ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
 
     var hasPermission by remember { mutableStateOf(granted()) }
+    var permissionDenied by remember { mutableStateOf(false) }
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         hasPermission = ok
+        permissionDenied = !ok
         if (ok) viewModel.refreshPairedDevices()
     }
     LaunchedEffect(hasPermission) { if (hasPermission) viewModel.refreshPairedDevices() }
+    // The permission may have been granted in system settings while the app was in the background.
+    LifecycleResumeEffect(Unit) {
+        hasPermission = granted()
+        onPauseOrDispose { }
+    }
 
     val connecting = state.connection is ConnectionState.Connecting
 
@@ -111,13 +120,16 @@ fun ConnectScreen(state: UiState, viewModel: ObdViewModel, onOpenSettings: () ->
                         }
                     }
                 }
-                is ConnectionState.Failed -> item {
-                    Card(
-                        Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-                    ) {
-                        Text(c.message, Modifier.padding(16.dp), color = MaterialTheme.colorScheme.onErrorContainer)
+                is ConnectionState.Failed -> {
+                    item {
+                        Card(
+                            Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                        ) {
+                            Text(c.message, Modifier.padding(16.dp), color = MaterialTheme.colorScheme.onErrorContainer)
+                        }
                     }
+                    state.diagnostics?.let { report -> item { DiagnosticsCard(report) } }
                 }
                 else -> Unit
             }
@@ -143,6 +155,7 @@ fun ConnectScreen(state: UiState, viewModel: ObdViewModel, onOpenSettings: () ->
                         Button(onClick = { permissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT) }) {
                             Text("Allow Bluetooth access")
                         }
+                        if (permissionDenied) PermissionDeniedHint()
                     }
                 }
                 !state.bluetoothEnabled -> item {
@@ -174,13 +187,11 @@ fun ConnectScreen(state: UiState, viewModel: ObdViewModel, onOpenSettings: () ->
                 }
             }
 
-            state.diagnostics?.let { report -> item { DiagnosticsCard(report) } }
-
             item {
                 ExpandableSection(
                     title = "Bluetooth LE adapter",
                     subtitle = "Adapters that don't appear in Bluetooth settings",
-                    expanded = showBle || state.bleDevices.isNotEmpty(),
+                    expanded = showBle,
                     onToggle = { showBle = !showBle },
                 ) { BleSection(state, viewModel, enabled = !connecting) }
             }
@@ -297,14 +308,17 @@ private val blePermissions: Array<String> =
 private fun BleSection(state: UiState, viewModel: ObdViewModel, enabled: Boolean) {
     val context = LocalContext.current
     var showUnnamed by rememberSaveable { mutableStateOf(false) }
+    var denied by remember { mutableStateOf(false) }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
-        if (results.values.all { it }) viewModel.scanBle()
+        denied = !results.values.all { it }
+        if (!denied) viewModel.scanBle()
     }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Hint(
             "For adapters that don't show up in Bluetooth settings, like Innova, Vgate iCar Pro BLE and OBDLink CX. " +
                 "Plug the adapter in and turn the ignition on first. Close the adapter's own app, and don't pair it " +
-                "in Android's Bluetooth settings (remove it there if you did).",
+                "in Android's Bluetooth settings (remove it there if you did)." +
+                (if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) " On this Android version, Location must be turned on to search." else ""),
         )
         Row(verticalAlignment = Alignment.CenterVertically) {
             Button(
@@ -322,6 +336,7 @@ private fun BleSection(state: UiState, viewModel: ObdViewModel, enabled: Boolean
             }
         }
         state.bleMessage?.let { Hint(it) }
+        if (denied) PermissionDeniedHint()
         if (!state.bleScanning && state.bleDevices.isEmpty() && state.bleMessage == null) {
             Hint("No devices listed yet.")
         }
@@ -351,7 +366,7 @@ private fun DiagnosticsCard(report: String) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Adapter diagnostics", style = MaterialTheme.typography.titleMedium)
-            Hint("This adapter didn't answer like an ELM327. Copy this report and share it so support for it can be added.")
+            Hint("What the adapter offered and answered while connecting. Copy it and share it to get help with this adapter.")
             SelectionContainer {
                 Text(report, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
             }
@@ -360,5 +375,19 @@ private fun DiagnosticsCard(report: String) {
                 copied = true
             }) { Text(if (copied) "Copied" else "Copy report") }
         }
+    }
+}
+
+/** Shown after a permission was refused: Android stops asking, so offer the app's settings page. */
+@Composable
+private fun PermissionDeniedHint() {
+    val context = LocalContext.current
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Hint("Permission was refused. If Android no longer asks, allow \"Nearby devices\" (or Location) in the app's settings.")
+        TextButton(onClick = {
+            context.startActivity(
+                Intent(AndroidSettings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", context.packageName, null)),
+            )
+        }) { Text("Open app settings") }
     }
 }

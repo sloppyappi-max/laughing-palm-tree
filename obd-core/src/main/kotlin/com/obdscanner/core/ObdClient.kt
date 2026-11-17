@@ -44,8 +44,12 @@ class ObdClient(private val channel: ElmChannel) {
      */
     private val lock = Mutex()
 
-    /** True while the adapter is not in its normal OBD-II state (custom header, filters, headers on…). */
-    private var modified = false
+    /**
+     * What a manufacturer request changed and the next normal request must undo. Tracked separately so
+     * only those settings are restored (and nothing CAN-specific is ever sent to an older car).
+     */
+    private var headerChanged = false
+    private var timeoutChanged = false
 
     /** Header currently set by a custom read, so consecutive reads to the same module skip ATSH. */
     private var currentHeader: String? = null
@@ -54,15 +58,26 @@ class ObdClient(private val channel: ElmChannel) {
     var supportsModuleAccess = false
         private set
 
+    /** ISO 15765 (CAN). Mode 06 results are only decoded in the CAN format. */
+    var isCan = false
+        private set
+
     private suspend fun sx(command: String, timeoutMs: Long = ElmChannel.DEFAULT_TIMEOUT_MS) =
         channel.exchange(command, timeoutMs)
 
     /** Puts the adapter back into the normal OBD-II setup after a manufacturer request. */
     private suspend fun restoreDefaults() {
-        if (!modified) return
-        for (cmd in listOf("ATH0", "ATCAF1", "ATCRA", "ATAR", "ATFCSM0", "ATST32", "ATSH7DF")) runCatching { sx(cmd) }
-        modified = false
-        currentHeader = null
+        if (timeoutChanged) {
+            runCatching { sx("ATST32") } // ELM327 default response timeout (~200 ms)
+            timeoutChanged = false
+        }
+        if (headerChanged) {
+            // Only ever set on 11-bit CAN cars, where 7DF is the OBD-II broadcast address and
+            // 7E8–7EF are the answers. CF/CM are supported by every ELM327 version, unlike CRA/AR.
+            for (cmd in listOf("ATSH7DF", "ATFCSM0", "ATAR", "ATCF7E8", "ATCM7F8")) runCatching { sx(cmd) }
+            headerChanged = false
+            currentHeader = null
+        }
     }
 
     /** One command in the normal OBD-II setup. */
@@ -72,11 +87,11 @@ class ObdClient(private val channel: ElmChannel) {
             sx(command, timeoutMs)
         }
 
-    /** Runs [block] with exclusive use of the adapter; settings it changes are restored by the next normal request. */
-    private suspend fun <T> session(block: suspend () -> T): T = lock.withLock {
-        modified = true
-        block()
-    }
+    /**
+     * Runs [block] with exclusive use of the adapter. Header / timeout changes it makes are flagged and
+     * restored by the next normal request; header and CAN-format changes are undone in place.
+     */
+    private suspend fun <T> session(block: suspend () -> T): T = lock.withLock { block() }
 
     /**
      * Resets the adapter, sets a compact output format and lets it find the
@@ -96,6 +111,7 @@ class ObdClient(private val channel: ElmChannel) {
         val responding = probe is ObdResponse.Data
         val protocol = if (responding) at("ATDP")?.removePrefix("AUTO, ") else null
         supportsModuleAccess = protocol?.contains("11/") == true
+        isCan = protocol?.contains("15765") == true || protocol?.contains("CAN") == true
 
         return AdapterInfo(
             ecus = if (responding) runCatching { discoverEcus() }.getOrDefault(emptyList()) else emptyList(),
@@ -106,9 +122,26 @@ class ObdClient(private val channel: ElmChannel) {
         )
     }
 
-    /** Sends a raw command and returns the adapter's cleaned-up text lines. */
-    suspend fun raw(command: String): List<String> =
-        ElmResponseParser.lines(send(command, timeoutMs = 10_000), command)
+    /**
+     * Sends a raw command (terminal) and returns the adapter's cleaned-up text lines. Settings commands
+     * that would change the output format the app relies on (reset, echo, spaces, headers…) are
+     * followed by the app's own setup so live data keeps working.
+     */
+    suspend fun raw(command: String): List<String> {
+        val cmd = command.replace(" ", "").uppercase()
+        val lines = ElmResponseParser.lines(send(cmd, timeoutMs = 10_000), cmd)
+        val readOnly = setOf("ATI", "AT@1", "ATDP", "ATDPN", "ATRV", "ATRD", "ATCS", "ATPPS")
+        if (cmd.startsWith("AT") && cmd !in readOnly) {
+            lock.withLock {
+                if (cmd.startsWith("ATZ") || cmd.startsWith("ATD") || cmd.startsWith("ATWS")) delay(500)
+                for (setup in listOf("ATE0", "ATL0", "ATS0", "ATH0", "ATCAF1", "ATAT1")) runCatching { sx(setup) }
+                if (cmd.startsWith("ATSH") || cmd.startsWith("ATCRA") || cmd.startsWith("ATCF") || cmd.startsWith("ATCM")) {
+                    headerChanged = supportsModuleAccess
+                }
+            }
+        }
+        return lines
+    }
 
     suspend fun query(mode: Int, pid: Int? = null, timeoutMs: Long = ElmChannel.DEFAULT_TIMEOUT_MS): ObdResponse {
         val command = if (pid == null) "%02X".format(mode) else "%02X%02X".format(mode, pid)
@@ -154,6 +187,7 @@ class ObdClient(private val channel: ElmChannel) {
      * EVAP, misfire…). CAN cars only.
      */
     suspend fun readMonitorTests(): List<MonitorTest> {
+        if (!isCan) return emptyList()
         val mids = supportedBitmask(0x06, last = 0xE0).filter { it % 0x20 != 0 }
         val tests = mutableListOf<MonitorTest>()
         for (mid in mids) {
@@ -183,9 +217,13 @@ class ObdClient(private val channel: ElmChannel) {
      * Turns headers on briefly to see which modules answer `0100`. Only safe while nothing
      * else is talking to the adapter, so it runs during [initialize].
      */
-    private suspend fun discoverEcus(): List<Ecu> = session {
+    private suspend fun discoverEcus(): List<Ecu> = lock.withLock {
         sx("ATH1")
-        val lines = ElmResponseParser.lines(sx("0100", timeoutMs = 5_000), "0100")
+        val lines = try {
+            ElmResponseParser.lines(sx("0100", timeoutMs = 5_000), "0100")
+        } finally {
+            runCatching { sx("ATH0") }
+        }
         lines.mapNotNull { raw ->
             val line = raw.replace(" ", "").uppercase()
             when (line.indexOf("4100")) {
@@ -263,8 +301,11 @@ class ObdClient(private val channel: ElmChannel) {
     private suspend fun target(requestId: Int) {
         val hex = "%03X".format(requestId)
         if (currentHeader == hex) return
+        headerChanged = true
         sx("ATSH$hex")
-        sx("ATCRA%03X".format(responseIdFor(requestId)))
+        // Receive filter: exactly this module's answer ID.
+        sx("ATCF%03X".format(responseIdFor(requestId)))
+        sx("ATCM7FF")
         // Flow control frames for multi-frame answers must go to this module's request ID.
         sx("ATFCSH$hex")
         sx("ATFCSD300000")
@@ -310,7 +351,7 @@ class ObdClient(private val channel: ElmChannel) {
             if (full) addAll((0x700..0x7DF).filterNot { it in 0x7E0..0x7E7 })
         }
         return session {
-            sx("ATH0")
+            timeoutChanged = true
             sx("ATST19") // ~100 ms per silent address instead of ~200 ms
             val found = mutableListOf<Module>()
             candidates.forEachIndexed { i, id ->
@@ -358,6 +399,7 @@ class ObdClient(private val channel: ElmChannel) {
      */
     private suspend fun readGmlanDtcs(module: Module, note: (String) -> Unit): List<ModuleDtc>? {
         try {
+            headerChanged = true
             sx("ATSH%03X".format(module.requestId))
             sx("ATH1")
             sx("ATCAF0")
@@ -373,8 +415,8 @@ class ObdClient(private val channel: ElmChannel) {
             if (frames.none { it.isNotEmpty() && it.u(0) == 0x81 }) return null
             return frames.mapNotNull(ModuleDtcParser::parseGmlanFrame).distinct()
         } finally {
-            sx("ATCAF1")
-            sx("ATH0")
+            runCatching { sx("ATCAF1") }
+            runCatching { sx("ATH0") }
         }
     }
 
@@ -385,6 +427,7 @@ class ObdClient(private val channel: ElmChannel) {
     suspend fun exploreDids(requestId: Int, from: Int, to: Int, onProgress: (Float) -> Unit = {}): Map<Int, ByteArray> {
         if (!supportsModuleAccess) return emptyMap()
         return session {
+            timeoutChanged = true
             sx("ATST19")
             val found = linkedMapOf<Int, ByteArray>()
             for (did in from..to) {

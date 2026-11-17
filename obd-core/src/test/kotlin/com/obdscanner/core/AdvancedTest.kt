@@ -22,6 +22,7 @@ class AdvancedTest {
 
     @Test
     fun readsMonitorTests() = runBlocking {
+        client.initialize() // learns that the car uses CAN
         val tests = client.readMonitorTests()
         assertEquals(4, tests.size)
         val o2 = tests.first { it.mid == 0x01 && it.tid == 0x01 }

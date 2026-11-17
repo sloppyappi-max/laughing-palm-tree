@@ -1,13 +1,17 @@
 package com.obdscanner.app
 
 import android.Manifest
+import android.graphics.Color
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -23,6 +27,22 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             val state by viewModel.state.collectAsStateWithLifecycle()
+            // Status / navigation bar icons must follow the app's theme choice, not the phone's,
+            // or a Light theme on a phone in dark mode gets white icons on a light background.
+            val dark = when (state.settings.theme) {
+                ThemeMode.SYSTEM -> isSystemInDarkTheme()
+                ThemeMode.LIGHT -> false
+                ThemeMode.DARK -> true
+            }
+            DisposableEffect(dark) {
+                val style = if (dark) {
+                    SystemBarStyle.dark(Color.TRANSPARENT)
+                } else {
+                    SystemBarStyle.light(Color.TRANSPARENT, Color.TRANSPARENT)
+                }
+                enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
+                onDispose { }
+            }
             ObdScannerTheme(state.settings) {
                 ObdApp(viewModel)
             }
