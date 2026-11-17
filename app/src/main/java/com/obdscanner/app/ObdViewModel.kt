@@ -291,6 +291,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                 obd.scanModules(full) { p -> _state.update { it.copy(scan = it.scan.copy(progress = p)) } }
             }.getOrElse { e ->
                 if (e is CancellationException) throw e
+                if (failIfLinkLost(e)) return@launchForConnection
                 SystemScan(emptyList(), "Scan failed: ${e.message}")
             }
             ensureActive()
@@ -522,6 +523,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
             _state.update { it.copy(adapterTestRunning = true) }
             val report = runCatching { obd.adapterReport() }.getOrElse { e ->
                 if (e is CancellationException) throw e
+                if (failIfLinkLost(e)) return@launchForConnection
                 "Adapter test failed: ${e.message}"
             }
             ensureActive()
@@ -575,8 +577,30 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         stopRecording()
         closeChannel()
         trip.reset()
-        _state.update { it.copy(connection = ConnectionState.Failed("Connection lost: ${e.message}")) }
+        _state.update {
+            it.copy(
+                connection = ConnectionState.Failed(
+                    "Lost the connection to the adapter (${e.message ?: e.javaClass.simpleName}). " +
+                        "Check it's still plugged in and close any other OBD app, then reconnect.",
+                ),
+            )
+        }
         resetConnectionJobs() // also ends the polling loop that called this
+    }
+
+    /**
+     * True when [e] means the link to the adapter itself is gone (socket closed, "Broken pipe",
+     * Bluetooth LE disconnect) rather than the car not answering in time.
+     */
+    private fun isLinkFailure(e: Throwable): Boolean =
+        (e is java.io.IOException && e !is ElmTimeoutException) ||
+            e is kotlinx.coroutines.channels.ClosedReceiveChannelException
+
+    /** For one-off requests: a dead link ends the connection instead of showing an error forever. */
+    private fun CoroutineScope.failIfLinkLost(e: Throwable): Boolean {
+        if (!isActive || !isLinkFailure(e)) return false
+        lostConnection(e as? Exception ?: java.io.IOException(e))
+        return true
     }
 
     /** The dashboard calls this when it becomes visible / hidden, so we only poll while someone is looking. */
@@ -646,6 +670,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                if (failIfLinkLost(e)) return@launchForConnection
                 _state.update { it.copy(monitorTests = it.monitorTests.copy(loading = false, message = "Could not read test results: ${e.message}")) }
             }
         }
@@ -694,7 +719,20 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                 trip.update(live[Pids.SPEED.code], live[Pids.MAF.code], live[Pids.FUEL_RATE.code], System.currentTimeMillis())
                 publishTrip()
                 writeRecordingRow()
-                if (round.size <= 1) delay(500)
+                if (round.isEmpty()) {
+                    // Nothing to read (e.g. the car isn't answering): check the adapter every few seconds
+                    // so a dropped link is noticed, and keep the voltage current.
+                    delay(4_000)
+                    try {
+                        obd.batteryVoltage()?.let { v -> _state.update { it.copy(batteryVoltage = v) } }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        if (failIfLinkLost(e)) return@launchForConnection
+                    }
+                } else if (round.size <= 1) {
+                    delay(500)
+                }
             }
         }
     }
@@ -711,6 +749,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                if (failIfLinkLost(e)) return@launchForConnection
                 _state.update { it.copy(codes = it.codes.copy(loading = false, message = "Could not read codes: ${e.message}")) }
             }
         }
@@ -738,7 +777,9 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         val obd = client ?: return
         launchForConnection {
             _state.update { it.copy(vinLoading = true) }
-            val info = runCatching { obd.readVehicleInfo() }.getOrNull()
+            val infoResult = runCatching { obd.readVehicleInfo() }
+            infoResult.exceptionOrNull()?.let { if (failIfLinkLost(it)) return@launchForConnection }
+            val info = infoResult.getOrNull()
             val voltage = runCatching { obd.batteryVoltage() }.getOrNull()
             ensureActive()
             _state.update {
@@ -759,7 +800,10 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         if (cmd.isEmpty()) return
         launchForConnection {
             val reply = runCatching { obd.raw(cmd).joinToString("\n").ifEmpty { "(empty)" } }
-                .getOrElse { "Error: ${it.message}" }
+                .getOrElse { e ->
+                    if (failIfLinkLost(e)) return@launchForConnection
+                    "Error: ${e.message}"
+                }
             ensureActive()
             _state.update { it.copy(terminal = (it.terminal + "> $cmd" + reply).takeLast(200)) }
         }
