@@ -4,7 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
-import android.provider.Settings
+import android.provider.Settings as AndroidSettings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
@@ -53,11 +53,17 @@ import androidx.core.content.ContextCompat
 import com.obdscanner.app.ConnectionState
 import com.obdscanner.app.ObdViewModel
 import com.obdscanner.app.SavedAdapter
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import com.obdscanner.app.UiState
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ConnectScreen(state: UiState, viewModel: ObdViewModel) {
+fun ConnectScreen(state: UiState, viewModel: ObdViewModel, onOpenSettings: () -> Unit) {
     val context = LocalContext.current
     fun granted() = Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
         ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
@@ -71,12 +77,26 @@ fun ConnectScreen(state: UiState, viewModel: ObdViewModel) {
 
     val connecting = state.connection is ConnectionState.Connecting
 
-    Scaffold(topBar = { TopAppBar(title = { Text("OBD Scanner") }) }) { padding ->
+    var showBle by rememberSaveable { mutableStateOf(false) }
+    var showWifi by rememberSaveable { mutableStateOf(false) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("OBD Scanner") },
+                actions = {
+                    IconButton(onClick = onOpenSettings) { Icon(Icons.Filled.Settings, contentDescription = "Settings") }
+                },
+            )
+        },
+    ) { padding ->
         LazyColumn(
             modifier = Modifier.padding(padding),
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            if (state.savedAdapter == null && !connecting) item { GettingStartedCard() }
+
             when (val c = state.connection) {
                 is ConnectionState.Connecting -> item {
                     Card(Modifier.fillMaxWidth()) {
@@ -128,7 +148,7 @@ fun ConnectScreen(state: UiState, viewModel: ObdViewModel) {
                 !state.bluetoothEnabled -> item {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Hint("Bluetooth is turned off.")
-                        OutlinedButton(onClick = { context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }) {
+                        OutlinedButton(onClick = { context.startActivity(Intent(AndroidSettings.ACTION_BLUETOOTH_SETTINGS)) }) {
                             Text("Open Bluetooth settings")
                         }
                     }
@@ -147,7 +167,7 @@ fun ConnectScreen(state: UiState, viewModel: ObdViewModel) {
                         }
                     }
                     item {
-                        TextButton(onClick = { context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }) {
+                        TextButton(onClick = { context.startActivity(Intent(AndroidSettings.ACTION_BLUETOOTH_SETTINGS)) }) {
                             Text("Pair a new adapter…")
                         }
                     }
@@ -156,18 +176,76 @@ fun ConnectScreen(state: UiState, viewModel: ObdViewModel) {
 
             state.diagnostics?.let { report -> item { DiagnosticsCard(report) } }
 
-            item { SectionTitle("Bluetooth LE adapter") }
-            item { BleSection(state, viewModel, enabled = !connecting) }
+            item {
+                ExpandableSection(
+                    title = "Bluetooth LE adapter",
+                    subtitle = "Adapters that don't appear in Bluetooth settings",
+                    expanded = showBle || state.bleDevices.isNotEmpty(),
+                    onToggle = { showBle = !showBle },
+                ) { BleSection(state, viewModel, enabled = !connecting) }
+            }
+            item {
+                ExpandableSection(
+                    title = "Wi-Fi adapter",
+                    subtitle = "Adapters with their own Wi-Fi network",
+                    expanded = showWifi,
+                    onToggle = { showWifi = !showWifi },
+                ) { WifiForm(enabled = !connecting, onConnect = viewModel::connectWifi) }
+            }
 
-            item { SectionTitle("Wi-Fi adapter") }
-            item { WifiForm(enabled = !connecting, onConnect = viewModel::connectWifi) }
-
-            item { SectionTitle("No adapter?") }
             item {
                 OutlinedButton(onClick = viewModel::connectDemo, enabled = !connecting, modifier = Modifier.fillMaxWidth()) {
-                    Text("Try demo mode (simulated car)")
+                    Text("No adapter? Try demo mode")
                 }
             }
+        }
+    }
+}
+
+/** First-run explanation of what's needed. */
+@Composable
+private fun GettingStartedCard() {
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Get started", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onPrimaryContainer)
+            listOf(
+                "Plug an ELM327 OBD-II adapter into the port under the dashboard (driver's side).",
+                "Turn the ignition on, or start the engine.",
+                "Pick your adapter below. The first connection can take up to 15 seconds.",
+            ).forEachIndexed { i, step ->
+                Text("${i + 1}.  $step", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onPrimaryContainer)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExpandableSection(
+    title: String,
+    subtitle: String,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    Card(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.fillMaxWidth().clickable(onClick = onToggle).padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.titleSmall)
+                Hint(subtitle)
+            }
+            Icon(
+                if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                contentDescription = if (expanded) "Collapse" else "Expand",
+            )
+        }
+        if (expanded) {
+            Column(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 16.dp)) { content() }
         }
     }
 }

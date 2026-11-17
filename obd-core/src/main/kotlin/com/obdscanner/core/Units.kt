@@ -24,6 +24,20 @@ object Units {
         }
     }
 
+    /** Inverse of [display]: turns a number typed in [system]'s unit back into the PID's metric unit. */
+    fun toMetric(pid: Pid, shown: Double, system: UnitSystem): Double {
+        if (system == UnitSystem.METRIC || pid.label != null) return shown
+        return when (pid.unit) {
+            "°C" -> (shown - 32) * 5 / 9
+            "km/h", "km" -> shown * 1.609344
+            "kPa" -> shown / 0.1450377
+            "L/h" -> shown * 3.785412
+            "g/s" -> shown / 0.1322774
+            "Nm" -> shown / 0.7375621
+            else -> shown
+        }
+    }
+
     /** Top of a gauge scale for [pid] in [system]. */
     fun gaugeMax(pid: Pid, system: UnitSystem): Double = when {
         pid == Pids.RPM -> 7000.0

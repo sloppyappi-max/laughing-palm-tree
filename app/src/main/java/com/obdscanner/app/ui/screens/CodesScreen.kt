@@ -2,7 +2,11 @@ package com.obdscanner.app.ui.screens
 
 import android.content.Intent
 import android.net.Uri
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.Alignment
+import com.obdscanner.app.ui.theme.Caution
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -67,7 +71,7 @@ fun CodesScreen(state: UiState, viewModel: ObdViewModel, modifier: Modifier = Mo
                     containerColor = if (milOn) Danger.copy(alpha = 0.18f) else MaterialTheme.colorScheme.surfaceVariant,
                 ),
             ) {
-                Column(Modifier.padding(16.dp)) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(
                         when {
                             monitor == null -> "Check engine light: unknown"
@@ -78,31 +82,30 @@ fun CodesScreen(state: UiState, viewModel: ObdViewModel, modifier: Modifier = Mo
                         fontWeight = FontWeight.SemiBold,
                         color = if (milOn) Danger else MaterialTheme.colorScheme.onSurface,
                     )
-                    if (monitor != null) {
-                        Text("${monitor.dtcCount} confirmed code(s) reported by the car", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        when {
+                            codes.loading -> "Reading codes…"
+                            codes.loaded && codes.codes.isEmpty() -> "No trouble codes found."
+                            codes.loaded -> "${codes.codes.size} code(s) found: " +
+                                DtcType.entries.mapNotNull { t ->
+                                    codes.codes.count { it.type == t }.takeIf { it > 0 }?.let { "$it ${t.label.lowercase()}" }
+                                }.joinToString(", ")
+                            else -> "Tap Read codes to check."
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (codes.loaded && codes.codes.isEmpty()) Ok else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(Modifier.padding(top = 8.dp)) {
+                        Button(onClick = viewModel::readCodes, enabled = !codes.loading) { Text("Read codes") }
+                        Spacer(Modifier.width(12.dp))
+                        OutlinedButton(onClick = { confirmClear = true }, enabled = !codes.loading && codes.loaded) { Text("Clear codes") }
                     }
                 }
             }
         }
 
-        codes.monitor?.takeIf { it.monitors.isNotEmpty() }?.let { monitor -> item { ReadinessCard(monitor) } }
-
-        item {
-            Row {
-                Button(onClick = viewModel::readCodes, enabled = !codes.loading) { Text("Read codes") }
-                Spacer(Modifier.width(12.dp))
-                OutlinedButton(onClick = { confirmClear = true }, enabled = !codes.loading && codes.loaded) { Text("Clear codes") }
-            }
-        }
-
         if (codes.loading) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
         codes.message?.let { msg -> item { Hint(msg) } }
-
-        if (codes.loaded && codes.codes.isEmpty()) {
-            item {
-                Text("No trouble codes found.", color = Ok, style = MaterialTheme.typography.titleMedium)
-            }
-        }
 
         for (type in DtcType.entries) {
             val ofType = codes.codes.filter { it.type == type }
@@ -112,6 +115,8 @@ fun CodesScreen(state: UiState, viewModel: ObdViewModel, modifier: Modifier = Mo
         }
 
         codes.freezeFrame?.let { frame -> item { FreezeFrameCard(frame, state.units) } }
+
+        codes.monitor?.takeIf { it.monitors.isNotEmpty() }?.let { monitor -> item { ReadinessCard(monitor) } }
 
         item {
             Hint(
@@ -145,7 +150,29 @@ private fun DtcCard(dtc: Dtc, vehicle: String?) {
     val context = LocalContext.current
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(start = 16.dp, top = 16.dp, end = 8.dp, bottom = 4.dp)) {
-            Text(dtc.code, style = MaterialTheme.typography.titleLarge, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    dtc.code,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f),
+                )
+                val (tagColor, tagText) = when (dtc.type) {
+                    DtcType.STORED -> Danger to "Stored"
+                    DtcType.PENDING -> Caution to "Pending"
+                    DtcType.PERMANENT -> MaterialTheme.colorScheme.tertiary to "Permanent"
+                }
+                Text(
+                    tagText,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = tagColor,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier
+                        .background(tagColor.copy(alpha = 0.14f), RoundedCornerShape(50))
+                        .padding(horizontal = 10.dp, vertical = 3.dp),
+                )
+            }
             Text(dtc.description, style = MaterialTheme.typography.bodyMedium)
             TextButton(onClick = {
                 val query = listOfNotNull(dtc.code, vehicle).joinToString(" ")

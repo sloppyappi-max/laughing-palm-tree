@@ -88,19 +88,29 @@ data class UiState(
     val bleMessage: String? = null,
     /** Bluetooth LE link report shown after a failed connection, for investigating unknown adapters. */
     val diagnostics: String? = null,
-    val units: UnitSystem = UnitSystem.METRIC,
+    val settings: AppSettings = AppSettings(units = UnitSystem.METRIC),
     /** Recent samples per PID (metric), oldest first, for the dashboard graphs. */
     val history: Map<Int, List<Float>> = emptyMap(),
     val recording: Boolean = false,
     val recordedRows: Int = 0,
     val lastRecording: File? = null,
     val savedAdapter: SavedAdapter? = null,
-    val favorites: Set<Int> = Pids.DEFAULT_FAVORITES,
     val showAllSensors: Boolean = false,
     val trip: TripState = TripState(),
     val monitorTests: TestsState = TestsState(),
     val vehicleInfo: VehicleInfo? = null,
-)
+) {
+    val units: UnitSystem get() = settings.units
+    val favorites: List<Int> get() = settings.favorites
+
+    /** Sensors currently outside the user's alert limits. */
+    val triggeredAlerts: List<Pair<Pid, Double>>
+        get() = settings.alerts.mapNotNull { (code, alert) ->
+            val value = live[code] ?: return@mapNotNull null
+            val pid = Pids.byCode(code) ?: return@mapNotNull null
+            if (alert.isTriggered(value)) pid to value else null
+        }
+}
 
 private const val HISTORY_SIZE = 90
 
@@ -122,15 +132,10 @@ data class TestsState(
 class ObdViewModel(app: Application) : AndroidViewModel(app) {
 
     private val prefs = app.getSharedPreferences("settings", Context.MODE_PRIVATE)
+    private val settingsStore = SettingsStore(prefs)
 
     private val _state = MutableStateFlow(
-        UiState(
-            units = prefs.getString("units", null)?.let { runCatching { UnitSystem.valueOf(it) }.getOrNull() }
-                ?: if (Locale.getDefault().country in setOf("US", "LR", "MM")) UnitSystem.IMPERIAL else UnitSystem.METRIC,
-            savedAdapter = loadSavedAdapter(),
-            favorites = prefs.getStringSet("favorites", null)?.mapNotNull { it.toIntOrNull() }?.toSet()
-                ?: Pids.DEFAULT_FAVORITES,
-        ),
+        UiState(settings = settingsStore.load(), savedAdapter = loadSavedAdapter()),
     )
     val state: StateFlow<UiState> = _state.asStateFlow()
 
@@ -167,9 +172,30 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         connect(AdapterTarget.Bluetooth(remote, device.name), saved) { Transports.bluetooth(remote) }
     }
 
-    fun setUnits(units: UnitSystem) {
-        prefs.edit().putString("units", units.name).apply()
-        _state.update { it.copy(units = units) }
+    fun setUnits(units: UnitSystem) = updateSettings { it.copy(units = units) }
+
+    /** Applies and persists a settings change. */
+    fun updateSettings(change: (AppSettings) -> AppSettings) {
+        _state.update { s -> s.copy(settings = change(s.settings).also(settingsStore::save)) }
+    }
+
+    /** Moves a favorite one place earlier (-1) or later (+1) on the dashboard. */
+    fun moveFavorite(code: Int, direction: Int) = updateSettings { s ->
+        val list = s.favorites.toMutableList()
+        val from = list.indexOf(code)
+        val to = from + direction
+        if (from < 0 || to !in list.indices) return@updateSettings s
+        list.add(to, list.removeAt(from))
+        s.copy(favorites = list)
+    }
+
+    fun toggleGauge(code: Int) = updateSettings { s ->
+        s.copy(gauges = if (code in s.gauges) s.gauges - code else s.gauges + code)
+    }
+
+    /** Sets or clears (both null) the alert limits for a sensor, in metric units. */
+    fun setAlert(code: Int, low: Double?, high: Double?) = updateSettings { s ->
+        s.copy(alerts = if (low == null && high == null) s.alerts - code else s.alerts + (code to SensorAlert(low, high)))
     }
 
     /** Connects to the adapter that worked last time. */
@@ -290,10 +316,13 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                 val supported = if (info.vehicleResponding) obd.supportedPids() else emptySet()
                 // The VIN tells us the year and make, used to search trouble codes online.
                 val vin = if (info.vehicleResponding) runCatching { obd.readVin() }.getOrNull() else null
+                // Check-engine light status for the status line under every screen title.
+                val monitor = if (info.vehicleResponding) runCatching { obd.monitorStatus() }.getOrNull() else null
                 _state.update {
                     it.copy(
                         connection = ConnectionState.Connected(target, info),
                         supportedPids = supported,
+                        codes = CodesState(monitor = monitor),
                         vin = vin,
                         batteryVoltage = info.batteryVoltage,
                     )
@@ -361,20 +390,25 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
 
     /** PIDs shown on the dashboard: favorites, or every supported sensor in "All sensors" mode. */
     fun dashboardPids(state: UiState): List<Pid> =
-        Pids.ALL.filter { it.code in state.supportedPids && (state.showAllSensors || it.code in state.favorites) }
+        if (state.showAllSensors) {
+            Pids.ALL.filter { it.code in state.supportedPids }
+        } else {
+            state.favorites.mapNotNull(Pids::byCode).filter { it.code in state.supportedPids }
+        }
 
-    /** What to poll: the visible sensors plus whatever the trip computer needs. */
+    /** Big round gauges at the top of the dashboard, in the user's order. */
+    fun gaugePids(state: UiState): List<Pid> =
+        state.settings.gauges.mapNotNull(Pids::byCode).filter { it.code in state.supportedPids && it.label == null }
+
+    /** What to poll: gauges, visible sensors, sensors with alerts, and what the trip computer needs. */
     private fun pollPids(state: UiState): List<Pid> {
-        val tripPids = listOf(Pids.SPEED, Pids.MAF, Pids.FUEL_RATE).filter { it.code in state.supportedPids }
-        return (dashboardPids(state) + tripPids).distinct()
+        val extra = (listOf(Pids.SPEED, Pids.MAF, Pids.FUEL_RATE) + state.settings.alerts.keys.mapNotNull(Pids::byCode))
+            .filter { it.code in state.supportedPids }
+        return (gaugePids(state) + dashboardPids(state) + extra).distinct()
     }
 
-    fun toggleFavorite(code: Int) {
-        _state.update {
-            val favorites = if (code in it.favorites) it.favorites - code else it.favorites + code
-            prefs.edit().putStringSet("favorites", favorites.map(Int::toString).toSet()).apply()
-            it.copy(favorites = favorites)
-        }
+    fun toggleFavorite(code: Int) = updateSettings { s ->
+        s.copy(favorites = if (code in s.favorites) s.favorites - code else s.favorites + code)
     }
 
     fun setShowAllSensors(show: Boolean) = _state.update { it.copy(showAllSensors = show) }

@@ -21,6 +21,10 @@ through a cheap ELM327 OBD-II adapter (Bluetooth or Wi-Fi).
 - **Vehicle**: year/make, VIN, which modules answer (engine, transmission…), calibration IDs and
   CVNs (Mode 09), protocol, battery voltage, units setting (US or metric), and a raw command terminal.
 - **Reconnect** to the last adapter with one tap.
+- **Customizable**: Settings screen with theme (system / light / dark), accent colors or
+  Material You wallpaper colors, US or metric units, compact tiles, trend graphs, keep-screen-on.
+  Pick which sensors are favorites and big gauges, reorder them, and set **alerts** (low/high
+  limits) on any sensor — the tile turns red and a banner appears when one is exceeded.
 
 ## Project layout
 

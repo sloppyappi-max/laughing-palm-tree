@@ -87,26 +87,7 @@ fun VehicleScreen(
             }
         }
 
-        item { SectionTitle("Settings") }
-        item {
-            Card(Modifier.fillMaxWidth()) {
-                Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text("US units")
-                        Hint(if (state.units == UnitSystem.IMPERIAL) "°F, mph, psi, miles" else "°C, km/h, kPa, km")
-                    }
-                    Switch(
-                        checked = state.units == UnitSystem.IMPERIAL,
-                        onCheckedChange = { viewModel.setUnits(if (it) UnitSystem.IMPERIAL else UnitSystem.METRIC) },
-                    )
-                }
-            }
-        }
-
-        item { SectionTitle("Terminal") }
+        item { SectionTitle("Terminal (advanced)") }
         item { Hint("Send raw ELM327 or OBD commands, e.g. ATRV, ATDP, 010C, 0902.") }
         item { Terminal(onSend = viewModel::sendRaw) }
         items(state.terminal.reversed()) { line ->

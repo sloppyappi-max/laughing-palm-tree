@@ -76,6 +76,15 @@ class AdvancedTest {
     }
 
     @Test
+    fun convertsAlertLimitsBackToMetric() {
+        for (pid in Pids.ALL.filter { it.label == null }) {
+            val shown = Units.display(pid, 42.0, UnitSystem.IMPERIAL).value
+            assertEquals(pid.name, 42.0, Units.toMetric(pid, shown, UnitSystem.IMPERIAL), 1e-6)
+        }
+        assertEquals(110.0, Units.toMetric(Pids.COOLANT_TEMP, 230.0, UnitSystem.IMPERIAL), 0.01)
+    }
+
+    @Test
     fun showsStatusPidsAsWords() {
         val d = Units.display(Pids.FUEL_SYSTEM_STATUS, 2.0, UnitSystem.IMPERIAL)
         assertEquals("Closed loop", d.text)
