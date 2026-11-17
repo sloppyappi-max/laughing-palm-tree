@@ -66,7 +66,10 @@ fun VehicleScreen(
             }
         }
 
-        if (info.ecus.isNotEmpty() || state.vehicleInfo != null) {
+        val v = state.vehicleInfo
+        val hasModuleInfo = info.ecus.isNotEmpty() ||
+            (v != null && (v.ecuNames.isNotEmpty() || v.calibrationIds.isNotEmpty() || v.cvns.isNotEmpty()))
+        if (hasModuleInfo) {
             item { SectionTitle("Modules & calibration") }
             item {
                 Card(Modifier.fillMaxWidth()) {
@@ -89,6 +92,7 @@ fun VehicleScreen(
         }
 
         item { SectionTitle("Advanced") }
+        item { AdapterTestCard(state, onRun = viewModel::runAdapterTest) }
         item { IdExplorerCard(state, viewModel) }
 
         item { SectionTitle("Terminal (advanced)") }
@@ -122,7 +126,7 @@ private fun Terminal(onSend: (String) -> Unit) {
             onValueChange = { command = it },
             singleLine = true,
             modifier = Modifier.weight(1f),
-            placeholder = { Text("010C") },
+            placeholder = { Text("Type a command, e.g. 010C") },
             keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters, imeAction = ImeAction.Send),
             keyboardActions = KeyboardActions(onSend = { send() }),
         )

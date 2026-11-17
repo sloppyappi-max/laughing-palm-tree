@@ -20,6 +20,11 @@ class SimulatedElmChannel(
     private val autoSearchWorks: Boolean = true,
     /** True simulates an adapter that ignores ATH0 and always prints CAN headers. */
     private val alwaysHeaders: Boolean = false,
+    /**
+     * True simulates a car where the OBD broadcast (7DF) only gets a refusal (7F 01 11) from some
+     * module and the engine computer answers only when addressed directly at 7E0.
+     */
+    private val broadcastRefused: Boolean = false,
 ) : ElmChannel {
 
     private var protocolNumber = "0"
@@ -197,8 +202,11 @@ class SimulatedElmChannel(
             cmd == "ATH1" -> { headers = true; "OK" }
             cmd == "ATH0" -> { headers = false; "OK" }
             cmd.startsWith("ATSH") -> { target = cmd.removePrefix("ATSH"); "OK" }
-            !cmd.startsWith("AT") && target != "7DF" -> moduleResponse(target, cmd)
-            headers && cmd == "0100" && can11 -> "7E806" + hex(0x41, 0x00, *supportMask(0x00)) + "\r7E906" + hex(0x41, 0x00, 0x80, 0, 0, 0)
+            broadcastRefused && target == "7DF" && cmd.startsWith("01") -> if (headers) "7E9037F0111" else "7F0111"
+            // At 7E0 the engine answers normal OBD requests too; module-only services go to moduleResponse.
+            !cmd.startsWith("AT") && target != "7DF" && (target != "7E0" || cmd.take(2) in setOf("3E", "19", "22")) ->
+                moduleResponse(target, cmd)
+            headers && cmd == "0100" && can11 && target == "7DF" -> "7E806" + hex(0x41, 0x00, *supportMask(0x00)) + "\r7E906" + hex(0x41, 0x00, 0x80, 0, 0, 0)
             headers && cmd == "0100" -> "486B10" + hex(0x41, 0x00, *supportMask(0x00)) + "00"
             // With headers on, normal answers carry the sender's ID, which breaks header-less parsing.
             (headers || alwaysHeaders) && cmd.length == 4 && cmd.startsWith("01") -> {

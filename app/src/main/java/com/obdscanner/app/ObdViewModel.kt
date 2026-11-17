@@ -120,6 +120,9 @@ data class UiState(
     val scan: ScanState = ScanState(),
     val explorer: ExplorerState = ExplorerState(),
     val vehicleRetrying: Boolean = false,
+    val adapterTestRunning: Boolean = false,
+    /** Raw output of the adapter test, for troubleshooting. */
+    val adapterReport: String? = null,
 ) {
     val units: UnitSystem get() = settings.units
     val favorites: List<Int> get() = settings.favorites
@@ -511,6 +514,26 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Runs the read-only adapter test sequence and keeps its raw output for sharing. */
+    fun runAdapterTest() {
+        val obd = client ?: return
+        if (_state.value.adapterTestRunning) return
+        launchForConnection {
+            _state.update { it.copy(adapterTestRunning = true) }
+            val report = runCatching { obd.adapterReport() }.getOrElse { e ->
+                if (e is CancellationException) throw e
+                "Adapter test failed: ${e.message}"
+            }
+            ensureActive()
+            val info = (_state.value.connection as? ConnectionState.Connected)?.info
+            val header = listOfNotNull(
+                "OBD Scanner adapter test",
+                info?.probeResponse?.let { "Detection:\n$it" },
+            ).joinToString("\n\n")
+            _state.update { it.copy(adapterTestRunning = false, adapterReport = "$header\n\n$report") }
+        }
+    }
+
     fun disconnect() {
         resetConnectionJobs()
         stopRecording()
@@ -535,6 +558,9 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                 batteryVoltage = null,
                 terminal = emptyList(),
                 diagnostics = null,
+                adapterReport = null,
+                adapterTestRunning = false,
+                vehicleRetrying = false,
             )
         }
     }

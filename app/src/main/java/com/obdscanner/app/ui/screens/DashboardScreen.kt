@@ -19,6 +19,11 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import android.content.Intent
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
@@ -85,7 +90,7 @@ fun DashboardScreen(
     }
 
     if (!connection.info.vehicleResponding) {
-        NotRespondingCard(state, connection, onRetry = viewModel::retryVehicle, modifier = modifier)
+        NotRespondingCard(state, connection, onRetry = viewModel::retryVehicle, onRunTest = viewModel::runAdapterTest, modifier = modifier)
         return
     }
 
@@ -423,6 +428,7 @@ private fun NotRespondingCard(
     state: UiState,
     connection: ConnectionState.Connected,
     onRetry: () -> Unit,
+    onRunTest: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val volts = state.batteryVoltage
@@ -450,7 +456,40 @@ private fun NotRespondingCard(
                 Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("What the adapter answered", style = MaterialTheme.typography.labelLarge)
                     Text(answer, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-                    Hint("Adapter: ${connection.info.elmVersion ?: "unknown"}. If Try again doesn't help, send a screenshot of this.")
+                    Hint("Adapter: ${connection.info.elmVersion ?: "unknown"}.")
+                }
+            }
+        }
+        AdapterTestCard(state, onRun = onRunTest)
+    }
+}
+
+/** One tap: a read-only test sequence whose raw output pinpoints adapter / car problems. */
+@Composable
+internal fun AdapterTestCard(state: UiState, onRun: () -> Unit) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Adapter test", style = MaterialTheme.typography.titleSmall)
+            Hint("Sends a short read-only sequence and shows every raw answer, including which modules reply. Share the result to get help.")
+            OutlinedButton(onClick = onRun, enabled = !state.adapterTestRunning) {
+                Text(if (state.adapterTestRunning) "Testing… (about 20 s)" else "Run adapter test")
+            }
+            state.adapterReport?.let { report ->
+                SelectionContainer {
+                    Text(report, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { clipboard.setText(AnnotatedString(report)) }) { Text("Copy") }
+                    TextButton(onClick = {
+                        val send = Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_SUBJECT, "OBD Scanner adapter test")
+                            putExtra(Intent.EXTRA_TEXT, report)
+                        }
+                        context.startActivity(Intent.createChooser(send, "Share adapter test"))
+                    }) { Text("Share") }
                 }
             }
         }

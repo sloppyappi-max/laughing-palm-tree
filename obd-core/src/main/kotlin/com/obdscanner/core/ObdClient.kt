@@ -56,6 +56,12 @@ class ObdClient(private val channel: ElmChannel) {
     /** Header currently set by a custom read, so consecutive reads to the same module skip ATSH. */
     private var currentHeader: String? = null
 
+    /**
+     * Header for normal OBD-II requests. Normally the broadcast 7DF; switched to the engine
+     * computer's own address 7E0 for cars/adapters where only a direct request gets an answer.
+     */
+    private var obdHeader = "7DF"
+
     /** Only 11-bit CAN cars (2008+ in the US) support module addressing in this app. */
     var supportsModuleAccess = false
         private set
@@ -76,7 +82,7 @@ class ObdClient(private val channel: ElmChannel) {
         if (headerChanged) {
             // Only ever set on 11-bit CAN cars, where 7DF is the OBD-II broadcast address and
             // 7E8–7EF are the answers. CF/CM are supported by every ELM327 version, unlike CRA/AR.
-            for (cmd in listOf("ATSH7DF", "ATFCSM0", "ATAR", "ATCF7E8", "ATCM7F8")) runCatching { sx(cmd) }
+            for (cmd in listOf("ATSH$obdHeader", "ATFCSM0", "ATAR", "ATCF7E8", "ATCM7F8")) runCatching { sx(cmd) }
             headerChanged = false
             currentHeader = null
         }
@@ -116,16 +122,34 @@ class ObdClient(private val channel: ElmChannel) {
      * starts the engine) without resetting the adapter.
      */
     suspend fun detectVehicle(elmVersion: String? = null): AdapterInfo {
-        var lastRaw = ""
+        val attempts = mutableListOf<String>()
         var responding = false
+        var refusedBy: String? = null // a protocol on which some module answered, but only with a refusal
         // 0 = automatic; 6/8 = CAN 11-bit / 29-bit at 500k (2008+ US cars), 7/9 = the same at 250k.
         for ((index, protocolNumber) in listOf("0", "6", "8", "7", "9").withIndex()) {
             send("ATSP$protocolNumber")
             // The automatic search can take ~10 s on its first request.
-            lastRaw = runCatching { send("0100", timeoutMs = if (index == 0) 15_000 else 5_000) }
+            val raw = runCatching { send("0100", timeoutMs = if (index == 0) 15_000 else 5_000) }
                 .getOrElse { if (it is ElmTimeoutException) "(no answer within the time limit)" else throw it }
-            responding = ElmResponseParser.parse(lastRaw, "0100") is ObdResponse.Data
+            attempts += "${protocolLabel(protocolNumber)}: ${summary(raw)}"
+            responding = ElmResponseParser.parse(raw, "0100") is ObdResponse.Data
             if (responding) break
+            if (refusedBy == null && isRefusal(raw)) refusedBy = protocolNumber
+        }
+
+        // Something answered "not supported" to the broadcast: the bus works, but the engine computer
+        // didn't reply. Ask it directly at its own address (7E0) — some setups only answer that.
+        if (!responding && refusedBy != null) {
+            send("ATSP$refusedBy")
+            lock.withLock {
+                headerChanged = true
+                runCatching { sx("ATSH7E0") }
+            }
+            val raw = runCatching { lock.withLock { sx("0100", 5_000) } }
+                .getOrElse { if (it is ElmTimeoutException) "(no answer within the time limit)" else throw it }
+            attempts += "Direct to engine (7E0): ${summary(raw)}"
+            responding = ElmResponseParser.parse(raw, "0100") is ObdResponse.Data
+            if (responding) obdHeader = "7E0"
         }
         if (!responding) send("ATSP0") // leave the adapter searching automatically
 
@@ -139,7 +163,7 @@ class ObdClient(private val channel: ElmChannel) {
             protocol = protocol,
             batteryVoltage = batteryVoltage(),
             vehicleResponding = responding,
-            probeResponse = ElmResponseParser.lines(lastRaw, "0100").joinToString(" | ").ifEmpty { "(empty)" },
+            probeResponse = attempts.joinToString("\n"),
         )
     }
 
@@ -175,6 +199,49 @@ class ObdClient(private val channel: ElmChannel) {
         val data = (query(0x01, pid.code) as? ObdResponse.Data)?.matching(0x01, pid.code)?.firstOrNull() ?: return null
         val payload = IntArray(data.size - 2) { data.u(it + 2) }
         return runCatching { pid.decode(payload) }.getOrNull()
+    }
+
+    private fun summary(raw: String) = ElmResponseParser.lines(raw, "0100").joinToString(" | ").ifEmpty { "(empty)" }
+
+    /** A negative response such as 7F 01 11: a module answered, but refused. */
+    private fun isRefusal(raw: String): Boolean =
+        ElmResponseParser.lines(raw, "0100").any { line ->
+            val hex = line.replace(" ", "").uppercase()
+            hex.startsWith("7F01") || (ElmResponseParser.stripCanHeader(hex)?.let { it.isNotEmpty() && it.u(0) == 0x7F } == true)
+        }
+
+    private fun protocolLabel(number: String) = when (number) {
+        "0" -> "Automatic"
+        "6" -> "CAN 11-bit 500k"
+        "7" -> "CAN 29-bit 500k"
+        "8" -> "CAN 11-bit 250k"
+        "9" -> "CAN 29-bit 250k"
+        else -> "Protocol $number"
+    }
+
+    /**
+     * Adapter test: a fixed read-only sequence whose raw answers show what the adapter and car are
+     * doing — including which module IDs answer (headers on). Leaves the adapter as it was.
+     */
+    suspend fun adapterReport(): String = lock.withLock {
+        val out = StringBuilder()
+        suspend fun run(cmd: String, timeout: Long = 5_000) {
+            val answer = runCatching { sx(cmd, timeout) }.getOrElse { "(${it.message})" }
+            out.appendLine("> $cmd")
+            out.appendLine(ElmResponseParser.lines(answer, cmd).joinToString("\n").ifEmpty { "(empty)" })
+        }
+        headerChanged = true // restore header and filters on the next normal request
+        for (cmd in listOf("ATI", "AT@1", "ATRV", "ATDP", "ATDPN")) run(cmd)
+        run("ATSH7DF")
+        run("0100", 10_000) // the normal OBD-II broadcast
+        run("ATH1")
+        run("0100", 10_000) // who answers the broadcast, with their CAN IDs
+        run("ATSH7E0")
+        run("0100") // directly to the engine computer
+        run("ATSH7E2")
+        run("0100") // directly to the transmission
+        run("ATH0")
+        out.toString().trimEnd()
     }
 
     /** The Mode 01 PIDs this car supports, from the 0100/0120/0140/… bitmasks. */

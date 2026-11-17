@@ -81,7 +81,7 @@ class RegressionTest {
         })
         val info = client.initialize()
         assertFalse(info.vehicleResponding)
-        assertEquals("SEARCHING... | UNABLE TO CONNECT", info.probeResponse)
+        assertTrue(info.probeResponse!!.startsWith("Automatic: SEARCHING... | UNABLE TO CONNECT\nCAN 11-bit 500k:"))
         assertEquals("ATSP0", sim.sent.last { it.startsWith("ATSP") }) // left on automatic
     }
 
@@ -101,5 +101,33 @@ class RegressionTest {
         // Plain header-less data is left alone (even length, or length byte doesn't fit).
         assertEquals(null, ElmResponseParser.stripCanHeader("410C1AF8"))
         assertEquals(null, ElmResponseParser.stripCanHeader("7E8FF410D32"))
+    }
+
+    @Test
+    fun asksTheEngineDirectlyWhenTheBroadcastIsOnlyRefused() = runBlocking {
+        // Seen on a 2013 Traverse with an Innova dongle: 0100 got only "7F0111".
+        val sim = SimulatedElmChannel(latencyMs = 0, broadcastRefused = true)
+        val client = ObdClient(sim)
+        val info = client.initialize()
+        assertTrue(info.probeResponse, info.vehicleResponding)
+        assertTrue(info.probeResponse!!.contains("Automatic: 7F0111"))
+        assertTrue(info.probeResponse!!.contains("Direct to engine (7E0): 4100"))
+        assertNotNull(client.read(Pids.RPM))
+        assertEquals(listOf("P0133", "P0420"), client.readDtcs(DtcType.STORED).map { it.code })
+        // After module access, normal requests go back to 7E0, not the broadcast.
+        client.scanModules()
+        sim.sent.clear()
+        assertNotNull(client.read(Pids.SPEED))
+        assertTrue(sim.sent.toString(), "ATSH7E0" in sim.sent && "ATSH7DF" !in sim.sent)
+    }
+
+    @Test
+    fun adapterReportShowsWhoAnswersAndRestoresSettings() = runBlocking {
+        val sim = SimulatedElmChannel(latencyMs = 0, broadcastRefused = true)
+        val client = ObdClient(sim).also { it.initialize() }
+        val report = client.adapterReport()
+        assertTrue(report, report.contains("> ATH1\nOK\n> 0100\n7E9037F0111"))
+        assertTrue(report, report.contains("> ATDP\nAUTO, ISO 15765-4 (CAN 11/500)"))
+        assertNotNull(client.read(Pids.RPM)) // headers off and 7E0 header restored
     }
 }
