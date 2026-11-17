@@ -117,7 +117,7 @@ fun DashboardScreen(
                 FilterChip(
                     selected = state.showAllSensors,
                     onClick = { viewModel.setShowAllSensors(true) },
-                    label = { Text("All sensors (${state.supportedPids.count { Pids.byCode(it) != null }})") },
+                    label = { Text("All sensors (${viewModel.dashboardPids(state.copy(showAllSensors = true)).size})") },
                 )
             }
         }
@@ -251,7 +251,12 @@ private fun SensorDetailDialog(pid: Pid, state: UiState, viewModel: ObdViewModel
                         }
                     }
                 }
-                Hint("PID 01 %02X · last ${history.size} readings".format(pid.code))
+                val request = pid.request
+                Hint(
+                    if (request == null) "Standard PID 01 %02X · last ${history.size} readings".format(pid.code)
+                    else "Module ${request.header} · command ${request.command}" +
+                        (if (request.verified) "" else " · unverified, values may be wrong") + " · last ${history.size} readings",
+                )
 
                 HorizontalDivider()
                 SwitchRow("Favorite", "Show on the Favorites dashboard", favorite) { viewModel.toggleFavorite(pid.code) }

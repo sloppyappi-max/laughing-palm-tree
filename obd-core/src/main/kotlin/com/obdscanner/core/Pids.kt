@@ -11,9 +11,12 @@ data class Pid(
     val decimals: Int = 0,
     /** For status PIDs: turns the decoded number into words (e.g. fuel system "Closed loop"). */
     val label: ((Double) -> String)? = null,
+    /** Set for manufacturer / custom sensors: which module to ask and what to send. Null = standard Mode 01. */
+    val request: PidRequest? = null,
     val decode: (IntArray) -> Double,
 ) {
-    val command: String get() = "01%02X".format(code)
+    val command: String get() = request?.command ?: "01%02X".format(code)
+    val isCustom: Boolean get() = request != null
 
     fun format(value: Double): String = label?.invoke(value) ?: "%.${decimals}f".format(value)
 }

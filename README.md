@@ -21,6 +21,15 @@ through a cheap ELM327 OBD-II adapter (Bluetooth or Wi-Fi).
 - **Vehicle**: year/make, VIN, which modules answer (engine, transmission…), calibration IDs and
   CVNs (Mode 09), protocol, battery voltage, units setting (US or metric), and a raw command terminal.
 - **Reconnect** to the last adapter with one tap.
+- **All-system scan (experimental)**: finds every module on the main CAN bus (engine,
+  transmission, ABS, airbag…) and reads its trouble codes (UDS `19 02`, falling back to GMLAN `A9`).
+  Read-only. The raw exchange can be shared for troubleshooting. Modules on GM's single-wire bus
+  (OBD pin 1) are out of reach for ELM327 adapters.
+- **Manufacturer & custom sensors**: built-in GM extras (e.g. transmission fluid temperature —
+  unverified until confirmed on a car) and your own sensors: module address, request and a formula
+  (`A-40`, `(A*256+B)/4`, `SIGNED16(A,B)/100`…). They work like any other sensor: favorites,
+  gauges, alerts, graphs, recording.
+- **ID explorer**: scans a module for data IDs (service `22`) that answer, to find new values.
 - **Customizable**: Settings screen with theme (system / light / dark), accent colors or
   Material You wallpaper colors, US or metric units, compact tiles, trend graphs, keep-screen-on.
   Pick which sensors are favorites and big gauges, reorder them, and set **alerts** (low/high

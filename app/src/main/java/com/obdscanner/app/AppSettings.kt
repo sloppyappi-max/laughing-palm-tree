@@ -1,7 +1,10 @@
 package com.obdscanner.app
 
 import android.content.SharedPreferences
+import com.obdscanner.core.CustomSensor
 import com.obdscanner.core.Pids
+import org.json.JSONArray
+import org.json.JSONObject
 import com.obdscanner.core.UnitSystem
 import java.util.Locale
 
@@ -36,6 +39,10 @@ data class AppSettings(
     /** Sensors shown as big round gauges at the top of the dashboard. */
     val gauges: List<Int> = listOf(Pids.RPM.code, Pids.SPEED.code),
     val alerts: Map<Int, SensorAlert> = emptyMap(),
+    /** Sensors the user added (module address + command + formula). */
+    val customSensors: List<CustomSensor> = emptyList(),
+    /** Built-in manufacturer sensors (GM) on cars of that make. */
+    val manufacturerExtras: Boolean = true,
 )
 
 class SettingsStore(private val prefs: SharedPreferences) {
@@ -55,6 +62,8 @@ class SettingsStore(private val prefs: SharedPreferences) {
             favorites = intList(prefs.getString("favorites_order", null)) ?: legacyFavorites() ?: defaults.favorites,
             gauges = intList(prefs.getString("gauges", null)) ?: defaults.gauges,
             alerts = parseAlerts(prefs.getString("alerts", null)),
+            customSensors = parseSensors(prefs.getString("custom_sensors", null)),
+            manufacturerExtras = prefs.getBoolean("manufacturer_extras", defaults.manufacturerExtras),
         )
     }
 
@@ -70,8 +79,35 @@ class SettingsStore(private val prefs: SharedPreferences) {
             .putString("favorites_order", s.favorites.joinToString(","))
             .putString("gauges", s.gauges.joinToString(","))
             .putString("alerts", s.alerts.entries.joinToString(";") { (pid, a) -> "$pid:${a.low ?: ""}:${a.high ?: ""}" })
+            .putString("custom_sensors", sensorsJson(s.customSensors))
+            .putBoolean("manufacturer_extras", s.manufacturerExtras)
             .apply()
     }
+
+    private fun sensorsJson(list: List<CustomSensor>): String = JSONArray().apply {
+        list.forEach { c ->
+            put(
+                JSONObject()
+                    .put("id", c.id).put("name", c.name).put("short", c.shortName).put("unit", c.unit)
+                    .put("header", c.header).put("command", c.command).put("formula", c.formula)
+                    .put("min", c.min).put("max", c.max),
+            )
+        }
+    }.toString()
+
+    private fun parseSensors(raw: String?): List<CustomSensor> = runCatching {
+        val array = JSONArray(raw ?: return emptyList())
+        (0 until array.length()).mapNotNull { i ->
+            val o = array.getJSONObject(i)
+            runCatching {
+                CustomSensor(
+                    id = o.getInt("id"), name = o.getString("name"), shortName = o.optString("short"),
+                    unit = o.optString("unit"), header = o.getString("header"), command = o.getString("command"),
+                    formula = o.getString("formula"), min = o.optDouble("min", 0.0), max = o.optDouble("max", 100.0),
+                )
+            }.getOrNull()
+        }
+    }.getOrDefault(emptyList())
 
     private inline fun <reified E : Enum<E>> enumOr(name: String?, default: E): E =
         name?.let { n -> runCatching { enumValueOf<E>(n) }.getOrNull() } ?: default

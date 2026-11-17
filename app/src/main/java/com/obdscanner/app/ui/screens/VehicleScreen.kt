@@ -87,6 +87,9 @@ fun VehicleScreen(
             }
         }
 
+        item { SectionTitle("Advanced") }
+        item { IdExplorerCard(state, viewModel) }
+
         item { SectionTitle("Terminal (advanced)") }
         item { Hint("Send raw ELM327 or OBD commands, e.g. ATRV, ATDP, 010C, 0902.") }
         item { Terminal(onSend = viewModel::sendRaw) }

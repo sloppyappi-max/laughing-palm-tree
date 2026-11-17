@@ -1,6 +1,8 @@
 package com.obdscanner.core
 
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /** What the adapter and car told us while connecting. */
 data class AdapterInfo(
@@ -37,26 +39,68 @@ data class VehicleInfo(
 class ObdClient(private val channel: ElmChannel) {
 
     /**
+     * Serialises whole operations, not just single commands: manufacturer requests change the
+     * adapter's header and filters, and nothing else may run until they are restored.
+     */
+    private val lock = Mutex()
+
+    /** True while the adapter is not in its normal OBD-II state (custom header, filters, headers on…). */
+    private var modified = false
+
+    /** Header currently set by a custom read, so consecutive reads to the same module skip ATSH. */
+    private var currentHeader: String? = null
+
+    /** Only 11-bit CAN cars (2008+ in the US) support module addressing in this app. */
+    var supportsModuleAccess = false
+        private set
+
+    private suspend fun sx(command: String, timeoutMs: Long = ElmChannel.DEFAULT_TIMEOUT_MS) =
+        channel.exchange(command, timeoutMs)
+
+    /** Puts the adapter back into the normal OBD-II setup after a manufacturer request. */
+    private suspend fun restoreDefaults() {
+        if (!modified) return
+        for (cmd in listOf("ATH0", "ATCAF1", "ATCRA", "ATAR", "ATFCSM0", "ATST32", "ATSH7DF")) runCatching { sx(cmd) }
+        modified = false
+        currentHeader = null
+    }
+
+    /** One command in the normal OBD-II setup. */
+    private suspend fun send(command: String, timeoutMs: Long = ElmChannel.DEFAULT_TIMEOUT_MS): String =
+        lock.withLock {
+            restoreDefaults()
+            sx(command, timeoutMs)
+        }
+
+    /** Runs [block] with exclusive use of the adapter; settings it changes are restored by the next normal request. */
+    private suspend fun <T> session(block: suspend () -> T): T = lock.withLock {
+        modified = true
+        block()
+    }
+
+    /**
      * Resets the adapter, sets a compact output format and lets it find the
      * car's protocol automatically.
      */
     suspend fun initialize(): AdapterInfo {
-        val reset = channel.exchange("ATZ", timeoutMs = 3_000)
+        val reset = send("ATZ", timeoutMs = 3_000)
         delay(500) // genuine ELM327s need a moment after reset
         val version = ElmResponseParser.lines(reset, "ATZ").firstOrNull { it.contains("ELM", ignoreCase = true) }
 
         for (cmd in listOf("ATE0", "ATL0", "ATS0", "ATH0", "ATAT1", "ATSP0")) {
-            channel.exchange(cmd)
+            send(cmd)
         }
 
         // The first request triggers the protocol search; it can take ~10 s.
-        val probe = ElmResponseParser.parse(channel.exchange("0100", timeoutMs = 15_000), "0100")
+        val probe = ElmResponseParser.parse(send("0100", timeoutMs = 15_000), "0100")
         val responding = probe is ObdResponse.Data
+        val protocol = if (responding) at("ATDP")?.removePrefix("AUTO, ") else null
+        supportsModuleAccess = protocol?.contains("11/") == true
 
         return AdapterInfo(
             ecus = if (responding) runCatching { discoverEcus() }.getOrDefault(emptyList()) else emptyList(),
             elmVersion = version,
-            protocol = if (responding) at("ATDP")?.removePrefix("AUTO, ") else null,
+            protocol = protocol,
             batteryVoltage = batteryVoltage(),
             vehicleResponding = responding,
         )
@@ -64,15 +108,16 @@ class ObdClient(private val channel: ElmChannel) {
 
     /** Sends a raw command and returns the adapter's cleaned-up text lines. */
     suspend fun raw(command: String): List<String> =
-        ElmResponseParser.lines(channel.exchange(command, timeoutMs = 10_000), command)
+        ElmResponseParser.lines(send(command, timeoutMs = 10_000), command)
 
     suspend fun query(mode: Int, pid: Int? = null, timeoutMs: Long = ElmChannel.DEFAULT_TIMEOUT_MS): ObdResponse {
         val command = if (pid == null) "%02X".format(mode) else "%02X%02X".format(mode, pid)
-        return ElmResponseParser.parse(channel.exchange(command, timeoutMs), command)
+        return ElmResponseParser.parse(send(command, timeoutMs), command)
     }
 
     /** Reads one PID; null when the car does not report it. */
     suspend fun read(pid: Pid): Double? {
+        pid.request?.let { return readCustom(pid, it) }
         val data = (query(0x01, pid.code) as? ObdResponse.Data)?.matching(0x01, pid.code)?.firstOrNull() ?: return null
         val payload = IntArray(data.size - 2) { data.u(it + 2) }
         return runCatching { pid.decode(payload) }.getOrNull()
@@ -138,22 +183,18 @@ class ObdClient(private val channel: ElmChannel) {
      * Turns headers on briefly to see which modules answer `0100`. Only safe while nothing
      * else is talking to the adapter, so it runs during [initialize].
      */
-    private suspend fun discoverEcus(): List<Ecu> {
-        channel.exchange("ATH1")
-        try {
-            val lines = ElmResponseParser.lines(channel.exchange("0100", timeoutMs = 5_000), "0100")
-            return lines.mapNotNull { raw ->
-                val line = raw.replace(" ", "").uppercase()
-                when (line.indexOf("4100")) {
-                    5 -> line.substring(0, 3) // 11-bit CAN: 7E8 06 41 00 …
-                    10 -> line.substring(0, 8) // 29-bit CAN: 18DAF110 06 41 00 …
-                    6 -> line.substring(4, 6) // older protocols: 48 6B 10 41 00 … (sender is the 3rd byte)
-                    else -> null
-                }
-            }.distinct().sorted().map(::Ecu)
-        } finally {
-            channel.exchange("ATH0")
-        }
+    private suspend fun discoverEcus(): List<Ecu> = session {
+        sx("ATH1")
+        val lines = ElmResponseParser.lines(sx("0100", timeoutMs = 5_000), "0100")
+        lines.mapNotNull { raw ->
+            val line = raw.replace(" ", "").uppercase()
+            when (line.indexOf("4100")) {
+                5 -> line.substring(0, 3) // 11-bit CAN: 7E8 06 41 00 …
+                10 -> line.substring(0, 8) // 29-bit CAN: 18DAF110 06 41 00 …
+                6 -> line.substring(4, 6) // older protocols: 48 6B 10 41 00 … (sender is the 3rd byte)
+                else -> null
+            }
+        }.distinct().sorted().map(::Ecu)
     }
 
     suspend fun monitorStatus(): MonitorStatus? {
@@ -186,7 +227,7 @@ class ObdClient(private val channel: ElmChannel) {
     /** Data bytes of `02 <pid> 00` (frame 0), or null. */
     private suspend fun freezeFrameData(pid: Int): IntArray? {
         val command = "02%02X00".format(pid)
-        val response = ElmResponseParser.parse(channel.exchange(command), command) as? ObdResponse.Data ?: return null
+        val response = ElmResponseParser.parse(send(command), command) as? ObdResponse.Data ?: return null
         val m = response.matching(0x02, pid).firstOrNull() ?: return null
         // 42 <pid> <frame> data...  (some ECUs omit the frame byte)
         val start = if (m.size >= 4) 3 else 2
@@ -210,12 +251,159 @@ class ObdClient(private val channel: ElmChannel) {
         return Vin.parse(response.matching(0x09, 0x02))
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Manufacturer-specific access (11-bit CAN). Read-only services only:
+    // 0x3E TesterPresent, 0x22 ReadDataByIdentifier, 0x19 ReadDTCInformation, 0xA9 (GMLAN read DTCs).
+    // ---------------------------------------------------------------------------------------
+
+    /** Response ID for a request ID: +8 for the 7xx range, +0x400 for GM-style 2xx addresses. */
+    private fun responseIdFor(requestId: Int): Int = if (requestId < 0x300) requestId + 0x400 else requestId + 8
+
+    /** Points the adapter at one module: header, receive filter and ISO-TP flow control. */
+    private suspend fun target(requestId: Int) {
+        val hex = "%03X".format(requestId)
+        if (currentHeader == hex) return
+        sx("ATSH$hex")
+        sx("ATCRA%03X".format(responseIdFor(requestId)))
+        // Flow control frames for multi-frame answers must go to this module's request ID.
+        sx("ATFCSH$hex")
+        sx("ATFCSD300000")
+        sx("ATFCSM1")
+        currentHeader = hex
+    }
+
+    /** Positive-response payload of [command] sent to one module, or null (no answer / negative). */
+    private suspend fun requestFrom(requestId: Int, command: String, timeoutMs: Long = 2_000): ByteArray? {
+        target(requestId)
+        val response = ElmResponseParser.parse(sx(command, timeoutMs), command) as? ObdResponse.Data ?: return null
+        val service = command.substring(0, 2).toInt(16)
+        val echo = ElmResponseParser.hexToBytes(command.substring(2))
+        return response.messages.firstOrNull { m ->
+            m.isNotEmpty() && m.u(0) == service + 0x40 && echo.indices.all { i -> i + 1 < m.size && m[i + 1] == echo[i] }
+        }?.let { it.copyOfRange(1 + echo.size, it.size) }
+    }
+
+    /** Reads a manufacturer / custom sensor. */
+    private suspend fun readCustom(pid: Pid, request: PidRequest): Double? {
+        if (!supportsModuleAccess) return null
+        return session {
+            val data = requestFrom(request.headerId, request.command) ?: return@session null
+            runCatching { pid.decode(IntArray(data.size) { data.u(it) }) }.getOrNull()?.takeUnless { it.isNaN() }
+        }
+    }
+
+    /**
+     * All-system scan: asks every candidate address on the main CAN bus whether a module is there
+     * (TesterPresent), then reads each module's trouble codes. [onProgress] gets 0..1.
+     *
+     * Body modules on GM's single-wire low-speed bus (OBD pin 1) can't be reached by an ELM327.
+     */
+    suspend fun scanModules(full: Boolean = false, onProgress: (Float) -> Unit = {}): SystemScan {
+        val log = StringBuilder()
+        fun note(line: String) { log.appendLine(line) }
+        if (!supportsModuleAccess) {
+            return SystemScan(emptyList(), "Module scan needs an 11-bit CAN car (most 2008+ US vehicles).")
+        }
+        val candidates = buildList {
+            addAll(0x7E0..0x7E7)
+            addAll(0x240..0x25F) // GM high-speed GMLAN physical addresses
+            if (full) addAll((0x700..0x7DF).filterNot { it in 0x7E0..0x7E7 })
+        }
+        return session {
+            sx("ATH0")
+            sx("ATST19") // ~100 ms per silent address instead of ~200 ms
+            val found = mutableListOf<Module>()
+            candidates.forEachIndexed { i, id ->
+                onProgress(i.toFloat() / (candidates.size * 2))
+                val answer = runCatching { requestFrom(id, "3E00", timeoutMs = 500) }.getOrNull()
+                if (answer != null) {
+                    found += Module(id, responseIdFor(id))
+                    note("found %03X -> %03X".format(id, responseIdFor(id)))
+                }
+            }
+            sx("ATST32")
+            note("modules: ${found.size}")
+            val reports = found.mapIndexed { i, module ->
+                onProgress(0.5f + i.toFloat() / (found.size * 2).coerceAtLeast(1))
+                readModuleDtcs(module, ::note)
+            }
+            onProgress(1f)
+            SystemScan(reports, log.toString())
+        }
+    }
+
+    /** Must run inside [session]. Tries UDS first, then GM's older GMLAN service. */
+    private suspend fun readModuleDtcs(module: Module, note: (String) -> Unit): ModuleReport {
+        val uds = requestRaw(module.requestId, "1902FF", note)
+        if (uds != null) {
+            val positive = uds.firstOrNull { it.isNotEmpty() && it.u(0) == 0x59 }
+            if (positive != null) return ModuleReport(module, ModuleDtcParser.parseUds(positive))
+        }
+        val gm = readGmlanDtcs(module, note)
+        if (gm != null) return ModuleReport(module, gm)
+        return ModuleReport(module, emptyList(), "This module didn't answer a trouble-code request the app knows.")
+    }
+
+    /** Like [requestFrom] but returns every message (including negative responses) and logs them. */
+    private suspend fun requestRaw(requestId: Int, command: String, note: (String) -> Unit): List<ByteArray>? {
+        target(requestId)
+        val raw = sx(command, 3_000)
+        note("%03X %s -> %s".format(requestId, command, raw.replace("\r", " | ").trim()))
+        return (ElmResponseParser.parse(raw, command) as? ObdResponse.Data)?.messages
+    }
+
+    /**
+     * GMLAN `$A9 81 12`: answers come as single raw frames on a different ID (0x5xx), without
+     * ISO-TP framing, so this listens with CAN formatting off. Experimental.
+     */
+    private suspend fun readGmlanDtcs(module: Module, note: (String) -> Unit): List<ModuleDtc>? {
+        try {
+            sx("ATSH%03X".format(module.requestId))
+            sx("ATH1")
+            sx("ATCAF0")
+            sx("ATCF500")
+            sx("ATCM700")
+            currentHeader = null
+            val raw = sx("03A98112", 3_000)
+            note("%03X A98112 -> %s".format(module.requestId, raw.replace("\r", " | ").trim()))
+            val frames = ElmResponseParser.lines(raw, "03A98112")
+                .map { it.replace(" ", "").uppercase() }
+                .filter { it.length >= 5 && it.all { c -> c.isDigit() || c in 'A'..'F' } }
+                .map { ElmResponseParser.hexToBytes(it.substring(3)) } // drop the 3-digit header
+            if (frames.none { it.isNotEmpty() && it.u(0) == 0x81 }) return null
+            return frames.mapNotNull(ModuleDtcParser::parseGmlanFrame).distinct()
+        } finally {
+            sx("ATCAF1")
+            sx("ATH0")
+        }
+    }
+
+    /**
+     * ID explorer: asks one module for every data identifier from [from] to [to] (service $22)
+     * and returns the ones that answered with their raw bytes. Read-only.
+     */
+    suspend fun exploreDids(requestId: Int, from: Int, to: Int, onProgress: (Float) -> Unit = {}): Map<Int, ByteArray> {
+        if (!supportsModuleAccess) return emptyMap()
+        return session {
+            sx("ATST19")
+            val found = linkedMapOf<Int, ByteArray>()
+            for (did in from..to) {
+                onProgress((did - from).toFloat() / (to - from + 1))
+                val data = runCatching { requestFrom(requestId, "22%04X".format(did), timeoutMs = 500) }.getOrNull()
+                if (data != null) found[did] = data
+            }
+            sx("ATST32")
+            onProgress(1f)
+            found
+        }
+    }
+
     /** Voltage at the OBD port, measured by the adapter itself (`ATRV`). */
     suspend fun batteryVoltage(): Double? =
         at("ATRV")?.uppercase()?.removeSuffix("V")?.trim()?.toDoubleOrNull()
 
     private suspend fun at(command: String): String? =
-        ElmResponseParser.lines(channel.exchange(command), command).firstOrNull()
+        ElmResponseParser.lines(send(command), command).firstOrNull()
             ?.takeUnless { it == "?" }
 }
 

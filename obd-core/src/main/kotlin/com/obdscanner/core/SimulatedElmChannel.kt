@@ -20,6 +20,8 @@ class SimulatedElmChannel(
     /** Clearing codes resets readiness monitors, like a real car. */
     private var cleared = false
     private var headers = false
+    /** Request ID set with ATSH; 7DF is the normal OBD-II broadcast. */
+    private var target = "7DF"
     private var odometerKm = 84_213.0
     private val startedAt = System.currentTimeMillis()
 
@@ -124,6 +126,47 @@ class SimulatedElmChannel(
         return canMessage(intArrayOf(0x46) + records)
     }
 
+    /**
+     * Fake modules for the all-system scan: engine and transmission answer UDS, an ABS module
+     * at GM-style address 241 has a code, and an airbag module at 247 only speaks GMLAN $A9.
+     */
+    private fun moduleResponse(module: String, cmd: String): String {
+        fun udsCodes(vararg codes: Pair<String, Int>): String {
+            val bytes = intArrayOf(0x59, 0x02, 0xFF) + codes.flatMap { (code, failure) ->
+                encodeDtc(code).toList() + listOf(failure, 0x2F)
+            }
+            return canMessage(bytes)
+        }
+        return when (module) {
+            "7E0" -> when (cmd) {
+                "3E00" -> "7E00"
+                "1902FF" -> udsCodes(*stored.map { it to 0x00 }.toTypedArray())
+                else -> "7F" + cmd.take(2) + "31"
+            }
+            "7E2" -> when (cmd) {
+                "3E00" -> "7E00"
+                "1902FF" -> udsCodes()
+                "221940" -> hex(0x62, 0x19, 0x40, (minOf(80.0, 30 + t() * 2) + 40).roundToInt())
+                "221941" -> hex(0x62, 0x19, 0x41, 0x03, 0x20)
+                else -> "7F" + cmd.take(2) + "31"
+            }
+            "241" -> when (cmd) {
+                "3E00" -> "7E00"
+                "1902FF" -> udsCodes("C0035" to 0x5A)
+                else -> "7F" + cmd.take(2) + "31"
+            }
+            "247" -> when (cmd) {
+                "3E00" -> "7E00"
+                "1902FF" -> "7F1911"
+                // GMLAN: raw frames from the module's UUDT ID, headers on, no ISO-TP length byte.
+                "03A98112" -> "547" + hex(0x81, *encodeDtc("B0001"), 0x00, 0x2F, 0, 0, 0) +
+                    "\r547" + hex(0x81, 0, 0, 0, 0, 0, 0, 0)
+                else -> "7F" + cmd.take(2) + "11"
+            }
+            else -> "NO DATA"
+        }
+    }
+
     override suspend fun exchange(command: String, timeoutMs: Long): String {
         delay(latencyMs)
         val cmd = command.uppercase().replace(" ", "")
@@ -135,6 +178,8 @@ class SimulatedElmChannel(
             cmd == "ATI" -> "ELM327 v1.5"
             cmd == "ATH1" -> { headers = true; "OK" }
             cmd == "ATH0" -> { headers = false; "OK" }
+            cmd.startsWith("ATSH") -> { target = cmd.removePrefix("ATSH"); "OK" }
+            !cmd.startsWith("AT") && target != "7DF" -> moduleResponse(target, cmd)
             headers && cmd == "0100" -> "7E806" + hex(0x41, 0x00, *supportMask(0x00)) + "\r7E906" + hex(0x41, 0x00, 0x80, 0, 0, 0)
             cmd.startsWith("AT") -> "OK"
             cmd == "03" -> dtcResponse(0x03, stored)

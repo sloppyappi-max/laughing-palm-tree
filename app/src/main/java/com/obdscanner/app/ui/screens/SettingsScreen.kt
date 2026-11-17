@@ -18,6 +18,18 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import com.obdscanner.core.CustomSensor
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -50,6 +62,17 @@ import com.obdscanner.core.Units
 fun SettingsScreen(state: UiState, viewModel: ObdViewModel, onBack: () -> Unit) {
     BackHandler(onBack = onBack)
     val s = state.settings
+    var editing by remember { mutableStateOf<CustomSensor?>(null) }
+    editing?.let { sensor ->
+        CustomSensorDialog(
+            initial = sensor,
+            isNew = s.customSensors.none { it.id == sensor.id },
+            onTest = viewModel::testCustomSensor,
+            onSave = { viewModel.saveCustomSensor(it); editing = null },
+            onDelete = { viewModel.deleteCustomSensor(sensor.id); editing = null },
+            onDismiss = { editing = null },
+        )
+    }
     fun update(change: (AppSettings) -> AppSettings) = viewModel.updateSettings(change)
 
     Scaffold(
@@ -128,7 +151,7 @@ fun SettingsScreen(state: UiState, viewModel: ObdViewModel, onBack: () -> Unit) 
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text("Gauges and favorites")
                         Hint(
-                            "Big gauges: " + (s.gauges.mapNotNull(Pids::byCode).joinToString { it.shortName }.ifEmpty { "none" }) +
+                            "Big gauges: " + (s.gauges.mapNotNull(state::pid).joinToString { it.shortName }.ifEmpty { "none" }) +
                                 ". ${s.favorites.size} favorite sensors. Tap any sensor on the dashboard to change these.",
                         )
                         TextButton(
@@ -148,7 +171,7 @@ fun SettingsScreen(state: UiState, viewModel: ObdViewModel, onBack: () -> Unit) 
                         }
                     }
                     s.alerts.entries.sortedBy { it.key }.forEachIndexed { index, (code, alert) ->
-                        val pid = Pids.byCode(code) ?: return@forEachIndexed
+                        val pid = state.pid(code) ?: return@forEachIndexed
                         if (index > 0) HorizontalDivider()
                         fun show(v: Double) = Units.display(pid, v, s.units).let { "${it.text} ${it.unit}" }
                         Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -158,6 +181,34 @@ fun SettingsScreen(state: UiState, viewModel: ObdViewModel, onBack: () -> Unit) 
                             }
                             TextButton(onClick = { viewModel.setAlert(code, null, null) }) { Text("Remove") }
                         }
+                    }
+                }
+            }
+
+            item { SectionTitle("Custom sensors") }
+            item {
+                SettingsCard {
+                    SwitchRow(
+                        "GM extra sensors",
+                        "Transmission fluid temperature and more on Chevrolet / GMC / Buick / Cadillac (unverified)",
+                        s.manufacturerExtras,
+                    ) { on -> update { it.copy(manufacturerExtras = on) } }
+                    HorizontalDivider()
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Hint(
+                            "Add any sensor your car's modules report: the module address, the request, and a formula " +
+                                "for the answer bytes. Find values with the ID explorer on the Vehicle tab.",
+                        )
+                        s.customSensors.sortedBy { it.name }.forEach { sensor ->
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(sensor.name)
+                                    Hint("${sensor.header} · ${sensor.command} · ${sensor.formula} ${sensor.unit}".trim())
+                                }
+                                TextButton(onClick = { editing = sensor }) { Text("Edit") }
+                            }
+                        }
+                        OutlinedButton(onClick = { editing = newSensor(s) }) { Text("Add custom sensor") }
                     }
                 }
             }
@@ -209,4 +260,82 @@ private fun Swatch(color: Color, selected: Boolean, label: String, onClick: () -
     ) {
         if (selected) Icon(Icons.Filled.Check, contentDescription = "$label selected", tint = Color.Black)
     }
+}
+
+private fun newSensor(s: AppSettings) = CustomSensor(
+    id = (s.customSensors.maxOfOrNull { it.id } ?: 0) + 1,
+    name = "", shortName = "", unit = "", header = "7E0", command = "22", formula = "A",
+)
+
+/** Create / edit a custom sensor, with live validation and a one-shot test read. */
+@Composable
+internal fun CustomSensorDialog(
+    initial: CustomSensor,
+    isNew: Boolean,
+    onTest: (CustomSensor, (String) -> Unit) -> Unit,
+    onSave: (CustomSensor) -> Unit,
+    onDelete: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var name by remember { mutableStateOf(initial.name) }
+    var short by remember { mutableStateOf(initial.shortName) }
+    var unit by remember { mutableStateOf(initial.unit) }
+    var header by remember { mutableStateOf(initial.header) }
+    var command by remember { mutableStateOf(initial.command) }
+    var formula by remember { mutableStateOf(initial.formula) }
+    var testResult by remember { mutableStateOf<String?>(null) }
+
+    val candidate = initial.copy(
+        name = name.trim(), shortName = short.trim(), unit = unit.trim(),
+        header = header.trim().uppercase(), command = command.replace(" ", "").uppercase(), formula = formula.trim(),
+    )
+    val error: String? = when {
+        candidate.name.isEmpty() -> "Give the sensor a name."
+        else -> runCatching { candidate.toPid(); null }.getOrElse { it.message ?: "Invalid" }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (isNew) "Add custom sensor" else "Edit custom sensor") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(name, { name = it }, label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(short, { short = it.take(14) }, label = { Text("Short name") }, singleLine = true, modifier = Modifier.weight(1f))
+                    OutlinedTextField(unit, { unit = it.take(8) }, label = { Text("Unit") }, singleLine = true, modifier = Modifier.weight(1f))
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        header, { header = it.take(3) }, label = { Text("Module") }, singleLine = true, modifier = Modifier.weight(1f),
+                        keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters),
+                    )
+                    OutlinedTextField(
+                        command, { command = it.take(16) }, label = { Text("Command (hex)") }, singleLine = true, modifier = Modifier.weight(2f),
+                        keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters),
+                    )
+                }
+                OutlinedTextField(
+                    formula, { formula = it }, label = { Text("Formula") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters),
+                )
+                Hint(
+                    "Module: 3-digit CAN ID, e.g. 7E0 engine, 7E2 transmission. Command: e.g. 221940 (read ID 1940). " +
+                        "Formula uses the answer bytes A, B, C…: e.g. A-40 or (A*256+B)/4. " +
+                        "Functions: SIGNED(A), SIGNED16(A,B), BIT(A,n), MIN, MAX, ABS.",
+                )
+                error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = { testResult = "Reading…"; onTest(candidate) { testResult = it } }, enabled = error == null) {
+                        Text("Test now")
+                    }
+                    testResult?.let { Hint(it) }
+                }
+                if (!isNew) {
+                    TextButton(onClick = onDelete) { Text("Delete sensor", color = MaterialTheme.colorScheme.error) }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { onSave(candidate) }, enabled = error == null) { Text("Save") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }

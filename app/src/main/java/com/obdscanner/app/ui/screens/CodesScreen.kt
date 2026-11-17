@@ -118,6 +118,8 @@ fun CodesScreen(state: UiState, viewModel: ObdViewModel, modifier: Modifier = Mo
 
         codes.monitor?.takeIf { it.monitors.isNotEmpty() }?.let { monitor -> item { ReadinessCard(monitor) } }
 
+        item { SystemScanCard(state, viewModel) }
+
         item {
             Hint(
                 "Stored codes turned the check-engine light on. Pending codes were seen once and are being watched. " +

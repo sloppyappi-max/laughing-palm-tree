@@ -16,7 +16,12 @@ import com.obdscanner.app.transport.BleLog
 import com.obdscanner.app.transport.Transports
 import com.obdscanner.core.AdapterInfo
 import com.obdscanner.core.Dtc
+import com.obdscanner.core.CustomSensor
 import com.obdscanner.core.FreezeFrame
+import com.obdscanner.core.ManufacturerPids
+import com.obdscanner.core.SystemScan
+import com.obdscanner.core.Units
+import com.obdscanner.core.VehicleIdentity
 import com.obdscanner.core.MonitorTest
 import com.obdscanner.core.TripComputer
 import com.obdscanner.core.VehicleInfo
@@ -99,18 +104,44 @@ data class UiState(
     val trip: TripState = TripState(),
     val monitorTests: TestsState = TestsState(),
     val vehicleInfo: VehicleInfo? = null,
+    /** True on 11-bit CAN cars, where module-addressed (manufacturer / custom) requests work. */
+    val moduleAccess: Boolean = false,
+    /** Custom sensors plus built-in manufacturer sensors for this car, as pollable PIDs. */
+    val customPids: List<Pid> = emptyList(),
+    val scan: ScanState = ScanState(),
+    val explorer: ExplorerState = ExplorerState(),
 ) {
     val units: UnitSystem get() = settings.units
     val favorites: List<Int> get() = settings.favorites
+
+    /** Any sensor by code: standard Mode 01 or custom / manufacturer. */
+    fun pid(code: Int): Pid? = Pids.byCode(code) ?: customPids.firstOrNull { it.code == code }
+
+    /** Whether this car can report [pid]. */
+    fun available(pid: Pid): Boolean = if (pid.isCustom) moduleAccess else pid.code in supportedPids
 
     /** Sensors currently outside the user's alert limits. */
     val triggeredAlerts: List<Pair<Pid, Double>>
         get() = settings.alerts.mapNotNull { (code, alert) ->
             val value = live[code] ?: return@mapNotNull null
-            val pid = Pids.byCode(code) ?: return@mapNotNull null
+            val pid = pid(code) ?: return@mapNotNull null
             if (alert.isTriggered(value)) pid to value else null
         }
 }
+
+data class ScanState(
+    val running: Boolean = false,
+    val progress: Float = 0f,
+    val result: SystemScan? = null,
+    val full: Boolean = false,
+)
+
+data class ExplorerState(
+    val running: Boolean = false,
+    val progress: Float = 0f,
+    val results: Map<Int, ByteArray>? = null,
+    val header: String = "7E0",
+)
 
 private const val HISTORY_SIZE = 90
 
@@ -135,7 +166,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     private val settingsStore = SettingsStore(prefs)
 
     private val _state = MutableStateFlow(
-        UiState(settings = settingsStore.load(), savedAdapter = loadSavedAdapter()),
+        UiState(settings = settingsStore.load(), savedAdapter = loadSavedAdapter()).let { it.copy(customPids = buildCustomPids(it)) },
     )
     val state: StateFlow<UiState> = _state.asStateFlow()
 
@@ -176,7 +207,78 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Applies and persists a settings change. */
     fun updateSettings(change: (AppSettings) -> AppSettings) {
-        _state.update { s -> s.copy(settings = change(s.settings).also(settingsStore::save)) }
+        _state.update { s ->
+            val next = s.copy(settings = change(s.settings).also(settingsStore::save))
+            next.copy(customPids = buildCustomPids(next))
+        }
+    }
+
+    /** User sensors, plus GM sensors when the VIN says GM (or in demo mode). Bad formulas are skipped. */
+    private fun buildCustomPids(state: UiState): List<Pid> {
+        val make = VehicleIdentity.fromVin(state.vin).make
+        val demo = (state.connection as? ConnectionState.Connected)?.target == AdapterTarget.Demo
+        val gm = make in setOf("Chevrolet", "GMC", "Cadillac", "Buick") || demo
+        val sensors = state.settings.customSensors +
+            (if (state.settings.manufacturerExtras && gm) ManufacturerPids.GM else emptyList())
+        return sensors.mapNotNull { runCatching { it.toPid() }.getOrNull() }
+    }
+
+    fun saveCustomSensor(sensor: CustomSensor) = updateSettings { s ->
+        s.copy(customSensors = s.customSensors.filterNot { it.id == sensor.id } + sensor)
+    }
+
+    fun deleteCustomSensor(id: Int) = updateSettings { s ->
+        val code = CustomSensor.CUSTOM_BASE + id
+        s.copy(
+            customSensors = s.customSensors.filterNot { it.id == id },
+            favorites = s.favorites - code,
+            gauges = s.gauges - code,
+            alerts = s.alerts - code,
+        )
+    }
+
+    /** Reads a sensor once so the editor can show what it returns. */
+    fun testCustomSensor(sensor: CustomSensor, onResult: (String) -> Unit) {
+        val obd = client ?: return onResult("Connect to the car first.")
+        if (!obd.supportsModuleAccess) return onResult("This car's protocol doesn't support module requests.")
+        val pid = runCatching { sensor.toPid() }.getOrElse { return onResult(it.message ?: "Invalid sensor") }
+        viewModelScope.launch {
+            val value = runCatching { obd.read(pid) }.getOrNull()
+            onResult(
+                if (value == null) "No answer. Check the module address and command."
+                else "Reads ${Units.display(pid, value, _state.value.units).let { "${it.text} ${it.unit}" }}",
+            )
+        }
+    }
+
+    // --- All-system scan and ID explorer ---
+
+    fun scanModules(full: Boolean) {
+        val obd = client ?: return
+        if (_state.value.scan.running) return
+        viewModelScope.launch {
+            _state.update { it.copy(scan = ScanState(running = true, full = full)) }
+            val result = runCatching {
+                obd.scanModules(full) { p -> _state.update { it.copy(scan = it.scan.copy(progress = p)) } }
+            }.getOrElse { e ->
+                if (e is CancellationException) throw e
+                SystemScan(emptyList(), "Scan failed: ${e.message}")
+            }
+            _state.update { it.copy(scan = ScanState(result = result, full = full)) }
+        }
+    }
+
+    fun exploreDids(header: String, from: Int, to: Int) {
+        val obd = client ?: return
+        val id = header.toIntOrNull(16) ?: return
+        if (_state.value.explorer.running) return
+        viewModelScope.launch {
+            _state.update { it.copy(explorer = ExplorerState(running = true, header = header)) }
+            val found = runCatching {
+                obd.exploreDids(id, from, to) { p -> _state.update { it.copy(explorer = it.explorer.copy(progress = p)) } }
+            }.getOrElse { e -> if (e is CancellationException) throw e; emptyMap() }
+            _state.update { it.copy(explorer = ExplorerState(results = found, header = header)) }
+        }
     }
 
     /** Moves a favorite one place earlier (-1) or later (+1) on the dashboard. */
@@ -327,6 +429,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                         batteryVoltage = info.batteryVoltage,
                     )
                 }
+                _state.update { it.copy(moduleAccess = obd.supportsModuleAccess).let { s -> s.copy(customPids = buildCustomPids(s)) } }
                 saved?.let(::saveAdapter)
                 if (liveActive) startPolling()
             } catch (e: CancellationException) {
@@ -359,6 +462,9 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                 codes = CodesState(),
                 monitorTests = TestsState(),
                 vehicleInfo = null,
+                moduleAccess = false,
+                scan = ScanState(),
+                explorer = ExplorerState(),
                 trip = TripState(),
                 vin = null,
                 vinLoading = false,
@@ -391,19 +497,19 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     /** PIDs shown on the dashboard: favorites, or every supported sensor in "All sensors" mode. */
     fun dashboardPids(state: UiState): List<Pid> =
         if (state.showAllSensors) {
-            Pids.ALL.filter { it.code in state.supportedPids }
+            Pids.ALL.filter { it.code in state.supportedPids } + state.customPids.filter(state::available)
         } else {
-            state.favorites.mapNotNull(Pids::byCode).filter { it.code in state.supportedPids }
+            state.favorites.mapNotNull(state::pid).filter(state::available)
         }
 
     /** Big round gauges at the top of the dashboard, in the user's order. */
     fun gaugePids(state: UiState): List<Pid> =
-        state.settings.gauges.mapNotNull(Pids::byCode).filter { it.code in state.supportedPids && it.label == null }
+        state.settings.gauges.mapNotNull(state::pid).filter { state.available(it) && it.label == null }
 
     /** What to poll: gauges, visible sensors, sensors with alerts, and what the trip computer needs. */
     private fun pollPids(state: UiState): List<Pid> {
-        val extra = (listOf(Pids.SPEED, Pids.MAF, Pids.FUEL_RATE) + state.settings.alerts.keys.mapNotNull(Pids::byCode))
-            .filter { it.code in state.supportedPids }
+        val extra = (listOf(Pids.SPEED, Pids.MAF, Pids.FUEL_RATE) + state.settings.alerts.keys.mapNotNull(state::pid))
+            .filter(state::available)
         return (gaugePids(state) + dashboardPids(state) + extra).distinct()
     }
 
