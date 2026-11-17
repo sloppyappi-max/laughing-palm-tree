@@ -59,7 +59,15 @@ private val KNOWN_LAYOUTS = listOf(
 )
 
 /** Standard services that never carry adapter data. */
-private val IGNORED_SERVICES = setOf(uuid16(0x1800), uuid16(0x1801), uuid16(0x180A), uuid16(0x180F))
+private val IGNORED_SERVICES = setOf(
+    uuid16(0x1800), uuid16(0x1801), uuid16(0x180A), uuid16(0x180F),
+    // Firmware-update services: never write to these.
+    uuid16(0xFE59), // Nordic secure DFU
+    UUID.fromString("00001530-1212-EFDE-1523-785FEABCD123"), // Nordic legacy DFU
+    UUID.fromString("F000FFC0-0451-4000-B000-000000000000"), // TI OAD
+    UUID.fromString("1D14D6EE-FD63-4FA1-BFA4-8F47B42119F0"), // Silicon Labs OTA
+    UUID.fromString("00010203-0405-0607-0809-0A0B0C0D1912"), // Telink OTA
+)
 
 /** Like `withTimeout { await() }`, but a timeout is an ordinary connection error, not a cancellation. */
 private suspend fun <T : Any> CompletableDeferred<T>.awaitWithin(ms: Long, what: String): T =
@@ -90,6 +98,7 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
     @Volatile private var pendingDescriptor: CompletableDeferred<Boolean>? = null
     @Volatile private var pendingWrite: CompletableDeferred<Boolean>? = null
     @Volatile private var failure: IOException? = null
+    @Volatile private var pendingMtu: CompletableDeferred<Int>? = null
 
     private val incoming = Channel<ByteArray>(Channel.UNLIMITED)
     private val lock = Mutex()
@@ -101,7 +110,10 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
             log.add("connected")
             connected.complete(Unit)
         } else {
-            val e = IOException("Bluetooth LE link closed (status $status)")
+            val e = IOException(
+                "Bluetooth LE link closed (status $status). If this is a brand dongle (e.g. Innova): close its own app " +
+                    "first, and if you paired it in Android's Bluetooth settings, remove it there.",
+            )
             log.add("disconnected: status=$status state=$newState")
             failure = e
             connected.completeExceptionally(e)
@@ -117,11 +129,16 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
         else discovered.completeExceptionally(IOException("Service discovery failed (status $status)"))
     }
 
+    override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+        pendingMtu?.complete(mtu)
+    }
+
     override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) {
         pendingDescriptor?.complete(status == BluetoothGatt.GATT_SUCCESS)
     }
 
     override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
+        if (status != BluetoothGatt.GATT_SUCCESS) log.add("write to ${c.uuid} failed: status $status")
         pendingWrite?.complete(status == BluetoothGatt.GATT_SUCCESS)
     }
 
@@ -210,30 +227,57 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
             for (c in service.characteristics) log.add("  char ${c.uuid} [${describeProperties(c)}]")
         }
 
-        val (notify, write) = pickCharacteristics()
-            ?: throw IOException("This device has no characteristics that look like a serial data link.")
-        log.add("using notify=${notify.uuid} write=${write.uuid}")
-        writeChar = write
-        enableNotifications(notify)
+        // Bigger packets help adapters that send whole answers at once; ignore if refused.
+        val mtu = CompletableDeferred<Int>()
+        pendingMtu = mtu
+        if (gatt.requestMtu(247)) withTimeoutOrNull(2_000) { mtu.await() }?.let { log.add("mtu $it") }
+
+        val candidates = candidateLinks()
+        if (candidates.isEmpty()) throw IOException("This device has no characteristics that look like a serial data link.")
+
+        // Brand dongles (Innova, BlueDriver-style…) can expose several data services. Try each and keep
+        // the one that answers a harmless "identify" command (ATI) like an ELM327 does.
+        for ((notify, write) in candidates) {
+            log.add("trying notify=${notify.uuid} write=${write.uuid}")
+            try {
+                enableNotifications(notify)
+                writeChar = write
+                val answer = exchange("ATI", 2_500)
+                log.add("ATI answered: ${answer.trim().replace("\r", " | ")}")
+                log.add("using notify=${notify.uuid} write=${write.uuid}")
+                return
+            } catch (e: IOException) {
+                log.add("no ELM327 answer: ${e.message}")
+                runCatching { gatt.setCharacteristicNotification(notify, false) }
+                failure?.let { throw it } // link dropped: stop trying
+            }
+        }
+        throw IOException(
+            "Connected, but the adapter didn't answer like an ELM327 on any channel. " +
+                "Copy the diagnostics report below and share it so support for it can be added.",
+        )
     }
 
-    private fun pickCharacteristics(): Pair<BluetoothGattCharacteristic, BluetoothGattCharacteristic>? {
+    /** Notify/write pairs worth trying: known adapter layouts first, then every other plausible pair. */
+    private fun candidateLinks(): List<Pair<BluetoothGattCharacteristic, BluetoothGattCharacteristic>> {
+        val out = mutableListOf<Pair<BluetoothGattCharacteristic, BluetoothGattCharacteristic>>()
         for ((serviceId, notifyId, writeId) in KNOWN_LAYOUTS) {
             val service = gatt.getService(serviceId) ?: continue
             val notify = service.getCharacteristic(notifyId) ?: continue
             val write = service.getCharacteristic(writeId) ?: continue
-            return notify to write
+            out += notify to write
         }
-        // Unknown adapter: take the first service with both a notifying and a writable characteristic.
         val notifyFlags = BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE
         val writeFlags = BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE
         for (service in gatt.services) {
             if (service.uuid in IGNORED_SERVICES) continue
-            val notify = service.characteristics.firstOrNull { it.can(notifyFlags) } ?: continue
-            val write = service.characteristics.firstOrNull { it.can(writeFlags) } ?: continue
-            return notify to write
+            val notifies = service.characteristics.filter { it.can(notifyFlags) }
+            val writes = service.characteristics.filter { it.can(writeFlags) }
+            for (n in notifies) for (w in writes) {
+                if (out.none { it.first.uuid == n.uuid && it.second.uuid == w.uuid }) out += n to w
+            }
         }
-        return null
+        return out.take(8) // enough for any real adapter, and keeps a broken device from taking forever
     }
 
     private suspend fun enableNotifications(c: BluetoothGattCharacteristic) {

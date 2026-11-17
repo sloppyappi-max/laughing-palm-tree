@@ -296,11 +296,16 @@ private val blePermissions: Array<String> =
 @Composable
 private fun BleSection(state: UiState, viewModel: ObdViewModel, enabled: Boolean) {
     val context = LocalContext.current
+    var showUnnamed by rememberSaveable { mutableStateOf(false) }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
         if (results.values.all { it }) viewModel.scanBle()
     }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Hint("For adapters that don't show up in Bluetooth settings. Plug the adapter in and turn the ignition on first.")
+        Hint(
+            "For adapters that don't show up in Bluetooth settings, like Innova, Vgate iCar Pro BLE and OBDLink CX. " +
+                "Plug the adapter in and turn the ignition on first. Close the adapter's own app, and don't pair it " +
+                "in Android's Bluetooth settings (remove it there if you did).",
+        )
         Row(verticalAlignment = Alignment.CenterVertically) {
             Button(
                 onClick = {
@@ -320,10 +325,16 @@ private fun BleSection(state: UiState, viewModel: ObdViewModel, enabled: Boolean
         if (!state.bleScanning && state.bleDevices.isEmpty() && state.bleMessage == null) {
             Hint("No devices listed yet.")
         }
-        state.bleDevices.forEach { device ->
+        val unnamed = state.bleDevices.count { !it.named }
+        if (unnamed > 0) {
+            TextButton(onClick = { showUnnamed = !showUnnamed }) {
+                Text(if (showUnnamed) "Hide unnamed devices" else "Show $unnamed unnamed device(s)")
+            }
+        }
+        state.bleDevices.filter { it.named || showUnnamed }.forEach { device ->
             Card(Modifier.fillMaxWidth()) {
                 ListItem(
-                    headlineContent = { Text(device.name) },
+                    headlineContent = { Text(device.name + if (device.looksLikeAdapter) "  · likely OBD adapter" else "") },
                     supportingContent = { Text("${device.address} · signal ${device.rssi} dBm") },
                     modifier = Modifier.clickable(enabled = enabled) { viewModel.connectBle(device) },
                 )

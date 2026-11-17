@@ -60,7 +60,12 @@ sealed interface ConnectionState {
 
 data class PairedDevice(val name: String, val address: String)
 
-data class BleDevice(val name: String, val address: String, val rssi: Int)
+data class BleDevice(val name: String, val address: String, val rssi: Int, val named: Boolean = true) {
+    /** Names OBD adapters typically advertise (ELM327 clones, Innova, Vgate, OBDLink, …). */
+    val looksLikeAdapter: Boolean
+        get() = named && Regex("OBD|ELM|INNOVA|VLINK|V-LINK|VGATE|ICAR|KONNWEI|VEEPEAK|CARISTA|BLCKTEC|\\bRS\\d", RegexOption.IGNORE_CASE)
+            .containsMatchIn(name)
+}
 
 /** The last adapter that connected successfully, for one-tap reconnect. */
 data class SavedAdapter(val kind: Kind, val name: String, val address: String, val port: Int = 0) {
@@ -345,13 +350,12 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         stopBleScan()
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
-                val name = result.scanRecord?.deviceName
-                    ?: runCatching { result.device.name }.getOrNull()
-                    ?: return // unnamed devices are almost never OBD adapters
-                val device = BleDevice(name, result.device.address, result.rssi)
+                val name = result.scanRecord?.deviceName ?: runCatching { result.device.name }.getOrNull()
+                val device = BleDevice(name ?: "Unnamed device", result.device.address, result.rssi, named = name != null)
                 _state.update { s ->
                     val list = s.bleDevices.filterNot { it.address == device.address } + device
-                    s.copy(bleDevices = list.sortedByDescending { it.rssi })
+                    // Likely adapters first, then named devices, each by signal strength.
+                    s.copy(bleDevices = list.sortedWith(compareByDescending<BleDevice> { it.looksLikeAdapter }.thenByDescending { it.named }.thenByDescending { it.rssi }))
                 }
             }
 
