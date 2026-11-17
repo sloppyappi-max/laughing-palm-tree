@@ -19,6 +19,8 @@ class SimulatedElmChannel(
     private var stored = storedCodes
     /** Clearing codes resets readiness monitors, like a real car. */
     private var cleared = false
+    private var headers = false
+    private var odometerKm = 84_213.0
     private val startedAt = System.currentTimeMillis()
 
     private fun t() = (System.currentTimeMillis() - startedAt) / 1000.0
@@ -35,6 +37,7 @@ class SimulatedElmChannel(
         return when (pid) {
             0x01 -> intArrayOf(if (stored.isEmpty()) 0x00 else 0x80 or stored.size, 0x07, 0xE5, if (cleared) 0x25 else 0x00)
             0x04 -> one((15 + wave * 55) * 255 / 100)
+            0x03 -> intArrayOf(if (t < 8) 1 else 2, 0)
             0x05 -> one(coolant + 40)
             0x06 -> one((100 + sin(t * 3) * 4) * 1.28)
             0x07 -> one(102.5 * 1.28)
@@ -45,19 +48,30 @@ class SimulatedElmChannel(
             0x0F -> one(28.0 + 40)
             0x10 -> two((3 + wave * 30) * 100)
             0x11 -> one((14 + wave * 50) * 255 / 100)
+            0x13 -> one(0x33.toDouble())
+            0x14 -> intArrayOf(((0.45 + sin(t * 9) * 0.4) * 200).roundToInt().coerceIn(0, 255), 0xFF)
+            0x15 -> intArrayOf(((0.7 + sin(t * 0.7) * 0.05) * 200).roundToInt(), 0xFF)
+            0x1C -> one(1.0)
             0x1F -> two(t)
             0x21 -> two(if (stored.isEmpty()) 0.0 else 132.0)
             0x2F -> one(62.0 * 255 / 100)
             0x31 -> two(4210.0)
             0x33 -> one(101.0)
             0x42 -> two((14.1 + sin(t) * 0.1) * 1000)
+            0x3C -> two((minOf(650.0, 150 + t * 20) + wave * 100 + 40) * 10)
+            0x44 -> two(1.0 * 65536 / 2)
             0x46 -> one(21.0 + 40)
+            0x49 -> one((10 + wave * 45) * 255 / 100)
+            0x51 -> one(1.0)
+            0xA6 -> (odometerKm * 10).toLong().let {
+                intArrayOf((it shr 24).toInt() and 0xFF, (it shr 16).toInt() and 0xFF, (it shr 8).toInt() and 0xFF, it.toInt() and 0xFF)
+            }
             0x5C -> one(minOf(98.0, 35 + t * 1.5) + 40)
             else -> null
         }
     }
 
-    private val supported = (0x01..0x60).filter { pidBytes(it) != null }.toSet()
+    private val supported = (0x01..0xC8).filter { it % 0x20 != 0 && pidBytes(it) != null }.toSet()
 
     private fun supportMask(base: Int): IntArray {
         var mask = 0L
@@ -93,6 +107,23 @@ class SimulatedElmChannel(
         return lines.joinToString("\r")
     }
 
+    private fun ascii(text: String, length: Int) = IntArray(length) { i -> text.getOrNull(i)?.code ?: 0 }
+
+    /** Mode 06 results: O2 sensor and catalyst pass, the 0.020" EVAP leak test fails. */
+    private fun monitorTests(mid: Int?): String {
+        fun record(mid: Int, tid: Int, uasid: Int, value: Int, min: Int, max: Int) =
+            intArrayOf(mid, tid, uasid, value shr 8, value and 0xFF, min shr 8, min and 0xFF, max shr 8, max and 0xFF)
+        val records = when (mid) {
+            0x00 -> return hex(0x46, 0x00, 0x80, 0x00, 0x00, 0x01) // MID 01, and more from 0x20
+            0x20 -> return hex(0x46, 0x20, 0x80, 0x00, 0x00, 0x10) // MIDs 21 and 3C
+            0x01 -> record(0x01, 0x01, 0x0A, 3690, 2459, 4918) + record(0x01, 0x05, 0x10, 80, 0, 120)
+            0x21 -> record(0x21, 0x80, 0x24, 33, 0, 70)
+            0x3C -> record(0x3C, 0x80, 0x01, 410, 0, 380)
+            else -> return "NO DATA"
+        }
+        return canMessage(intArrayOf(0x46) + records)
+    }
+
     override suspend fun exchange(command: String, timeoutMs: Long): String {
         delay(latencyMs)
         val cmd = command.uppercase().replace(" ", "")
@@ -102,6 +133,9 @@ class SimulatedElmChannel(
             cmd == "ATDP" -> "AUTO, ISO 15765-4 (CAN 11/500)"
             cmd == "ATDPN" -> "A6"
             cmd == "ATI" -> "ELM327 v1.5"
+            cmd == "ATH1" -> { headers = true; "OK" }
+            cmd == "ATH0" -> { headers = false; "OK" }
+            headers && cmd == "0100" -> "7E806" + hex(0x41, 0x00, *supportMask(0x00)) + "\r7E906" + hex(0x41, 0x00, 0x80, 0, 0, 0)
             cmd.startsWith("AT") -> "OK"
             cmd == "03" -> dtcResponse(0x03, stored)
             cmd == "07" -> dtcResponse(0x07, pendingCodes)
@@ -117,6 +151,10 @@ class SimulatedElmChannel(
                 }
             }
             cmd == "0902" -> canMessage(intArrayOf(0x49, 0x02, 0x01) + vin.map { it.code }.toIntArray())
+            cmd == "0904" -> canMessage(intArrayOf(0x49, 0x04, 0x01) + ascii("12653917", 16))
+            cmd == "0906" -> canMessage(intArrayOf(0x49, 0x06, 0x01, 0x1A, 0x2B, 0x3C, 0x4D))
+            cmd == "090A" -> canMessage(intArrayOf(0x49, 0x0A, 0x01) + ascii("ECM-EngineControl", 20))
+            cmd.length == 4 && cmd.startsWith("06") -> monitorTests(cmd.substring(2).toIntOrNull(16))
             cmd.length == 4 && cmd.startsWith("01") -> {
                 val pid = cmd.substring(2).toIntOrNull(16)
                 when {

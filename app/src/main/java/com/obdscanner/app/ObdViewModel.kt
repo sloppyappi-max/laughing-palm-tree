@@ -17,6 +17,9 @@ import com.obdscanner.app.transport.Transports
 import com.obdscanner.core.AdapterInfo
 import com.obdscanner.core.Dtc
 import com.obdscanner.core.FreezeFrame
+import com.obdscanner.core.MonitorTest
+import com.obdscanner.core.TripComputer
+import com.obdscanner.core.VehicleInfo
 import com.obdscanner.core.UnitSystem
 import com.obdscanner.core.DtcType
 import com.obdscanner.core.ElmChannel
@@ -92,9 +95,29 @@ data class UiState(
     val recordedRows: Int = 0,
     val lastRecording: File? = null,
     val savedAdapter: SavedAdapter? = null,
+    val favorites: Set<Int> = Pids.DEFAULT_FAVORITES,
+    val showAllSensors: Boolean = false,
+    val trip: TripState = TripState(),
+    val monitorTests: TestsState = TestsState(),
+    val vehicleInfo: VehicleInfo? = null,
 )
 
 private const val HISTORY_SIZE = 90
+
+data class TripState(
+    val available: Boolean = false,
+    val instantL100km: Double? = null,
+    val averageL100km: Double? = null,
+    val distanceKm: Double = 0.0,
+    val fuelLiters: Double = 0.0,
+)
+
+data class TestsState(
+    val loading: Boolean = false,
+    val loaded: Boolean = false,
+    val tests: List<MonitorTest> = emptyList(),
+    val message: String? = null,
+)
 
 class ObdViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -105,6 +128,8 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
             units = prefs.getString("units", null)?.let { runCatching { UnitSystem.valueOf(it) }.getOrNull() }
                 ?: if (Locale.getDefault().country in setOf("US", "LR", "MM")) UnitSystem.IMPERIAL else UnitSystem.METRIC,
             savedAdapter = loadSavedAdapter(),
+            favorites = prefs.getStringSet("favorites", null)?.mapNotNull { it.toIntOrNull() }?.toSet()
+                ?: Pids.DEFAULT_FAVORITES,
         ),
     )
     val state: StateFlow<UiState> = _state.asStateFlow()
@@ -294,6 +319,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         pollJob?.cancel()
         stopRecording()
         closeChannel()
+        trip.reset()
         // Forget everything about the car; keep settings and device lists.
         _state.update {
             it.copy(
@@ -302,6 +328,9 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                 live = emptyMap(),
                 history = emptyMap(),
                 codes = CodesState(),
+                monitorTests = TestsState(),
+                vehicleInfo = null,
+                trip = TripState(),
                 vin = null,
                 vinLoading = false,
                 batteryVoltage = null,
@@ -330,25 +359,82 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         if (active) startPolling() else pollJob?.cancel()
     }
 
-    /** PIDs shown on the dashboard: everything we know how to decode that the car supports. */
+    /** PIDs shown on the dashboard: favorites, or every supported sensor in "All sensors" mode. */
     fun dashboardPids(state: UiState): List<Pid> =
-        Pids.ALL.filter { it.code in state.supportedPids }
+        Pids.ALL.filter { it.code in state.supportedPids && (state.showAllSensors || it.code in state.favorites) }
+
+    /** What to poll: the visible sensors plus whatever the trip computer needs. */
+    private fun pollPids(state: UiState): List<Pid> {
+        val tripPids = listOf(Pids.SPEED, Pids.MAF, Pids.FUEL_RATE).filter { it.code in state.supportedPids }
+        return (dashboardPids(state) + tripPids).distinct()
+    }
+
+    fun toggleFavorite(code: Int) {
+        _state.update {
+            val favorites = if (code in it.favorites) it.favorites - code else it.favorites + code
+            prefs.edit().putStringSet("favorites", favorites.map(Int::toString).toSet()).apply()
+            it.copy(favorites = favorites)
+        }
+    }
+
+    fun setShowAllSensors(show: Boolean) = _state.update { it.copy(showAllSensors = show) }
+
+    private val trip = TripComputer()
+
+    fun resetTrip() {
+        trip.reset()
+        publishTrip()
+    }
+
+    private fun publishTrip() {
+        val supported = _state.value.supportedPids
+        val available = Pids.SPEED.code in supported && (Pids.MAF.code in supported || Pids.FUEL_RATE.code in supported)
+        _state.update {
+            it.copy(
+                trip = TripState(available, trip.instantL100km, trip.averageL100km, trip.distanceKm, trip.fuelLiters),
+            )
+        }
+    }
+
+    /** Mode 06 self-test results. */
+    fun runMonitorTests() {
+        val obd = client ?: return
+        viewModelScope.launch {
+            _state.update { it.copy(monitorTests = it.monitorTests.copy(loading = true, message = null)) }
+            try {
+                val tests = obd.readMonitorTests()
+                _state.update {
+                    it.copy(
+                        monitorTests = TestsState(
+                            loaded = true,
+                            tests = tests,
+                            message = if (tests.isEmpty()) "This car didn't report any self-test results (Mode 06 needs a 2008+ CAN car, or the tests haven't run since codes were cleared)." else null,
+                        ),
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(monitorTests = it.monitorTests.copy(loading = false, message = "Could not read test results: ${e.message}")) }
+            }
+        }
+    }
 
     private fun startPolling() {
         val obd = client ?: return
         if (pollJob?.isActive == true) return
         pollJob = viewModelScope.launch {
-            val all = dashboardPids(_state.value)
-            if (all.isEmpty()) return@launch
             // Refresh fast-changing values every round, and one slower value per round.
-            val fastCodes = setOf(Pids.RPM.code, Pids.SPEED.code, Pids.THROTTLE.code, Pids.ENGINE_LOAD.code)
-            val fast = all.filter { it.code in fastCodes }
-            val slow = all.filterNot { it.code in fastCodes }
+            // The list is re-read every round so favorites / "All sensors" apply immediately.
+            val fastCodes = setOf(Pids.RPM.code, Pids.SPEED.code, Pids.THROTTLE.code, Pids.ENGINE_LOAD.code, Pids.MAF.code)
             var slowIndex = 0
             var timeouts = 0
             while (isActive) {
-                val round = fast + listOfNotNull(slow.getOrNull(slowIndex))
-                if (slow.isNotEmpty()) slowIndex = (slowIndex + 1) % slow.size
+                val all = pollPids(_state.value)
+                val fast = all.filter { it.code in fastCodes }
+                val slow = all.filterNot { it.code in fastCodes }
+                val round = fast + listOfNotNull(slow.getOrNull(slowIndex % maxOf(slow.size, 1)))
+                slowIndex++
                 for (pid in round) {
                     try {
                         val value = obd.read(pid)
@@ -367,8 +453,11 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                         return@launch lostConnection(e)
                     }
                 }
+                val live = _state.value.live
+                trip.update(live[Pids.SPEED.code], live[Pids.MAF.code], live[Pids.FUEL_RATE.code], System.currentTimeMillis())
+                publishTrip()
                 writeRecordingRow()
-                if (fast.isEmpty() && slow.size <= 1) delay(500)
+                if (round.size <= 1) delay(500)
             }
         }
     }
@@ -411,9 +500,16 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         val obd = client ?: return
         viewModelScope.launch {
             _state.update { it.copy(vinLoading = true) }
-            val vin = runCatching { obd.readVin() }.getOrNull()
+            val info = runCatching { obd.readVehicleInfo() }.getOrNull()
             val voltage = runCatching { obd.batteryVoltage() }.getOrNull()
-            _state.update { it.copy(vin = vin, vinLoading = false, batteryVoltage = voltage ?: it.batteryVoltage) }
+            _state.update {
+                it.copy(
+                    vin = info?.vin ?: it.vin,
+                    vehicleInfo = info,
+                    vinLoading = false,
+                    batteryVoltage = voltage ?: it.batteryVoltage,
+                )
+            }
         }
     }
 

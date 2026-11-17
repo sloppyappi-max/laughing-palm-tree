@@ -1,6 +1,16 @@
 package com.obdscanner.app.ui.screens
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Row
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -35,9 +45,11 @@ import com.obdscanner.app.ObdViewModel
 import com.obdscanner.app.UiState
 import com.obdscanner.core.Pid
 import com.obdscanner.core.Pids
+import com.obdscanner.core.TripComputer
 import com.obdscanner.core.UnitSystem
 import com.obdscanner.core.Units
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DashboardScreen(
     state: UiState,
@@ -70,6 +82,7 @@ fun DashboardScreen(
     val pids = viewModel.dashboardPids(state)
     val gauges = listOf(Pids.RPM, Pids.SPEED).filter { it in pids }
     val tiles = pids - gauges.toSet()
+    var detail by remember { mutableStateOf<Pid?>(null) }
 
     LazyVerticalGrid(
         columns = GridCells.Adaptive(minSize = 150.dp),
@@ -78,14 +91,139 @@ fun DashboardScreen(
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        items(gauges, key = { "g${it.code}" }) { pid -> Gauge(pid, state.live[pid.code], state.units) }
+        item(span = { GridItemSpan(maxLineSpan) }, key = "filter") {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = !state.showAllSensors,
+                    onClick = { viewModel.setShowAllSensors(false) },
+                    label = { Text("Favorites") },
+                )
+                FilterChip(
+                    selected = state.showAllSensors,
+                    onClick = { viewModel.setShowAllSensors(true) },
+                    label = { Text("All sensors (${state.supportedPids.count { Pids.byCode(it) != null }})") },
+                )
+            }
+        }
+        if (state.trip.available) {
+            item(span = { GridItemSpan(maxLineSpan) }, key = "trip") { TripCard(state, onReset = viewModel::resetTrip) }
+        }
+        items(gauges, key = { "g${it.code}" }) { pid ->
+            Box(Modifier.clickable { detail = pid }) { Gauge(pid, state.live[pid.code], state.units) }
+        }
         if (pids.isEmpty()) {
-            item(span = { GridItemSpan(maxLineSpan) }) { Hint("This car reports no live data the app knows how to show.") }
+            item(span = { GridItemSpan(maxLineSpan) }) {
+                Hint(
+                    if (state.showAllSensors) "This car reports no live data the app knows how to show."
+                    else "No favorites yet. Open \"All sensors\", tap a sensor and add it to the dashboard.",
+                )
+            }
         }
         items(tiles, key = { it.code }) { pid ->
-            ValueTile(pid, state.live[pid.code], state.units, state.history[pid.code].orEmpty())
+            Box(Modifier.clickable { detail = pid }) {
+                ValueTile(pid, state.live[pid.code], state.units, state.history[pid.code].orEmpty())
+            }
+        }
+        item(span = { GridItemSpan(maxLineSpan) }, key = "hint") {
+            Hint("Tap a sensor for a bigger graph, or to add it to / remove it from your favorites.")
         }
     }
+
+    detail?.let { pid ->
+        SensorDetailDialog(
+            pid = pid,
+            value = state.live[pid.code],
+            history = state.history[pid.code].orEmpty(),
+            units = state.units,
+            favorite = pid.code in state.favorites,
+            onToggleFavorite = { viewModel.toggleFavorite(pid.code) },
+            onDismiss = { detail = null },
+        )
+    }
+}
+
+/** Live and average fuel economy, distance and fuel used since the last reset. */
+@Composable
+private fun TripCard(state: UiState, onReset: () -> Unit) {
+    val trip = state.trip
+    val imperial = state.units == UnitSystem.IMPERIAL
+    fun economy(l100: Double?): String = when {
+        l100 == null -> "—"
+        imperial -> "%.1f".format(TripComputer.l100kmToMpg(l100))
+        else -> "%.1f".format(l100)
+    }
+    val economyUnit = if (imperial) "mpg" else "L/100 km"
+    Card {
+        Column(Modifier.fillMaxWidth().padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Trip", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                TextButton(onClick = onReset) { Text("Reset") }
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                TripStat("Now", economy(trip.instantL100km), economyUnit)
+                TripStat("Average", economy(trip.averageL100km), economyUnit)
+                TripStat(
+                    "Distance",
+                    "%.1f".format(if (imperial) trip.distanceKm / 1.609344 else trip.distanceKm),
+                    if (imperial) "mi" else "km",
+                )
+                TripStat(
+                    "Fuel",
+                    "%.2f".format(if (imperial) trip.fuelLiters / 3.785412 else trip.fuelLiters),
+                    if (imperial) "gal" else "L",
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TripStat(label: String, value: String, unit: String) {
+    Column {
+        Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(value, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+        Text(unit, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+/** A bigger graph of one sensor with min / average / max of the recent samples. */
+@Composable
+private fun SensorDetailDialog(
+    pid: Pid,
+    value: Double?,
+    history: List<Float>,
+    units: UnitSystem,
+    favorite: Boolean,
+    onToggleFavorite: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    fun show(v: Double) = Units.display(pid, v, units).let { "${it.text} ${it.unit}".trim() }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(pid.name) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(value?.let(::show) ?: "—", style = MaterialTheme.typography.displaySmall, fontWeight = FontWeight.Bold)
+                if (pid.label == null) {
+                    Sparkline(history, Modifier.fillMaxWidth().height(140.dp))
+                    if (history.isNotEmpty()) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            TripStat("Min", show(history.min().toDouble()), "")
+                            TripStat("Average", show(history.average()), "")
+                            TripStat("Max", show(history.max().toDouble()), "")
+                        }
+                    }
+                }
+                Hint("PID 01 %02X · last ${history.size} readings".format(pid.code))
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        dismissButton = {
+            TextButton(onClick = onToggleFavorite) {
+                Text(if (favorite) "Remove from favorites" else "Add to favorites")
+            }
+        },
+    )
 }
 
 @Composable

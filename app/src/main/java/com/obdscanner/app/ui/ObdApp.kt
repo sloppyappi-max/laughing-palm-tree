@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Warning
@@ -33,11 +34,13 @@ import java.io.File
 import com.obdscanner.app.ui.screens.CodesScreen
 import com.obdscanner.app.ui.screens.ConnectScreen
 import com.obdscanner.app.ui.screens.DashboardScreen
+import com.obdscanner.app.ui.screens.TestsScreen
 import com.obdscanner.app.ui.screens.VehicleScreen
 
 private enum class Tab(val title: String, val icon: ImageVector) {
     Dashboard("Dashboard", Icons.Filled.Home),
     Codes("Trouble codes", Icons.Filled.Warning),
+    Tests("Self-tests", Icons.Filled.Build),
     Vehicle("Vehicle", Icons.Filled.Info),
 }
 
@@ -81,6 +84,7 @@ fun ObdApp(viewModel: ObdViewModel) {
         when (tab) {
             Tab.Dashboard -> DashboardScreen(state, viewModel, connection, modifier)
             Tab.Codes -> CodesScreen(state, viewModel, modifier)
+            Tab.Tests -> TestsScreen(state, viewModel, modifier)
             Tab.Vehicle -> VehicleScreen(state, viewModel, connection, modifier)
         }
     }

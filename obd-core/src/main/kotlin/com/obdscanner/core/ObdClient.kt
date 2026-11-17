@@ -9,6 +9,26 @@ data class AdapterInfo(
     val batteryVoltage: Double?,
     /** False when the adapter answered but the car's ECU did not (often: ignition off). */
     val vehicleResponding: Boolean,
+    /** Control modules that answered OBD requests (engine, transmission, …). */
+    val ecus: List<Ecu> = emptyList(),
+)
+
+/** A control module that answers OBD-II requests, identified by its response header. */
+data class Ecu(val header: String) {
+    val name: String get() = when (header.uppercase()) {
+        "7E8", "18DAF110", "10" -> "Engine (ECM)"
+        "7E9", "18DAF118", "18" -> "Transmission (TCM)"
+        "7EA", "18DAF128", "28" -> "Hybrid / ABS module"
+        else -> "Module $header"
+    }
+}
+
+/** Mode 09 identification data. */
+data class VehicleInfo(
+    val vin: String?,
+    val calibrationIds: List<String>,
+    val cvns: List<String>,
+    val ecuNames: List<String>,
 )
 
 /**
@@ -34,6 +54,7 @@ class ObdClient(private val channel: ElmChannel) {
         val responding = probe is ObdResponse.Data
 
         return AdapterInfo(
+            ecus = if (responding) runCatching { discoverEcus() }.getOrDefault(emptyList()) else emptyList(),
             elmVersion = version,
             protocol = if (responding) at("ATDP")?.removePrefix("AUTO, ") else null,
             batteryVoltage = batteryVoltage(),
@@ -58,11 +79,17 @@ class ObdClient(private val channel: ElmChannel) {
     }
 
     /** The Mode 01 PIDs this car supports, from the 0100/0120/0140/… bitmasks. */
-    suspend fun supportedPids(): Set<Int> {
+    suspend fun supportedPids(): Set<Int> = supportedBitmask(0x01, last = 0xC0)
+
+    /**
+     * Reads "which IDs are supported" bitmasks: request `<mode> 00` lists IDs 01–20, and the
+     * last bit says whether `<mode> 20` exists, and so on.
+     */
+    private suspend fun supportedBitmask(mode: Int, last: Int): Set<Int> {
         val supported = sortedSetOf<Int>()
         var base = 0x00
-        while (base <= 0xC0) {
-            val msgs = (query(0x01, base) as? ObdResponse.Data)?.matching(0x01, base) ?: break
+        while (base <= last) {
+            val msgs = (query(mode, base) as? ObdResponse.Data)?.matching(mode, base) ?: break
             var mask = 0L
             for (m in msgs) {
                 if (m.size < 6) continue
@@ -75,6 +102,58 @@ class ObdClient(private val channel: ElmChannel) {
             base += 0x20
         }
         return supported
+    }
+
+    /**
+     * Mode 06: results of the car's own emissions self-tests (catalyst, O2 sensors,
+     * EVAP, misfire…). CAN cars only.
+     */
+    suspend fun readMonitorTests(): List<MonitorTest> {
+        val mids = supportedBitmask(0x06, last = 0xE0).filter { it % 0x20 != 0 }
+        val tests = mutableListOf<MonitorTest>()
+        for (mid in mids) {
+            val response = query(0x06, mid) as? ObdResponse.Data ?: continue
+            for (m in response.matching(0x06, mid)) tests += MonitorTests.parse(m)
+        }
+        return tests
+    }
+
+    /** Mode 09: VIN, calibration IDs, calibration verification numbers and module names. */
+    suspend fun readVehicleInfo(): VehicleInfo {
+        suspend fun messages(pid: Int) =
+            (query(0x09, pid, timeoutMs = 10_000) as? ObdResponse.Data)?.matching(0x09, pid).orEmpty()
+
+        fun ascii(bytes: List<Byte>) = bytes.map { it.toInt() and 0xFF }
+            .filter { it in 0x20..0x7E }.map { it.toChar() }.joinToString("").trim()
+
+        val calIds = messages(0x04).flatMap { m -> m.drop(3).chunked(16).map(::ascii) }.filter { it.isNotEmpty() }
+        val cvns = messages(0x06).flatMap { m ->
+            m.drop(3).chunked(4).filter { it.size == 4 }.map { c -> c.joinToString("") { "%02X".format(it) } }
+        }
+        val names = messages(0x0A).map { m -> ascii(m.drop(3)) }.filter { it.isNotEmpty() }
+        return VehicleInfo(readVin(), calIds, cvns, names)
+    }
+
+    /**
+     * Turns headers on briefly to see which modules answer `0100`. Only safe while nothing
+     * else is talking to the adapter, so it runs during [initialize].
+     */
+    private suspend fun discoverEcus(): List<Ecu> {
+        channel.exchange("ATH1")
+        try {
+            val lines = ElmResponseParser.lines(channel.exchange("0100", timeoutMs = 5_000), "0100")
+            return lines.mapNotNull { raw ->
+                val line = raw.replace(" ", "").uppercase()
+                when (line.indexOf("4100")) {
+                    5 -> line.substring(0, 3) // 11-bit CAN: 7E8 06 41 00 …
+                    10 -> line.substring(0, 8) // 29-bit CAN: 18DAF110 06 41 00 …
+                    6 -> line.substring(4, 6) // older protocols: 48 6B 10 41 00 … (sender is the 3rd byte)
+                    else -> null
+                }
+            }.distinct().sorted().map(::Ecu)
+        } finally {
+            channel.exchange("ATH0")
+        }
     }
 
     suspend fun monitorStatus(): MonitorStatus? {

@@ -7,15 +7,19 @@ through a cheap ELM327 OBD-II adapter (Bluetooth or Wi-Fi).
 
 - **Connect** to a paired Bluetooth ELM327 (with fallbacks for picky clone adapters),
   a Bluetooth LE adapter (found by scanning), a Wi-Fi ELM327 (default `192.168.0.10:35000`), or a **demo car** to try the app with no hardware.
-- **Dashboard**: RPM and speed gauges plus every supported sensor the app can decode
-  (coolant, load, throttle, MAF, MAP, fuel trims, fuel level, voltage, oil temp…), each with a
-  live trend graph. Only polls while the screen is visible; fast values refresh every round.
+- **Dashboard**: RPM and speed gauges plus your favorite sensors, each with a live trend graph.
+  Switch to **All sensors** to see every one of the ~90 standard Mode 01 sensors the car supports
+  (O2 sensors, wide-band λ, catalyst temperatures, EVAP, fuel rail, torque, odometer, fuel system
+  status…). Tap any sensor for a big graph with min / average / max and to add it to favorites.
+- **Trip computer**: live and average MPG (or L/100 km), distance and fuel used.
 - **Recording**: tap *Record* on the dashboard to log live data to CSV, then *Share log*.
 - **Trouble codes**: check-engine light status, stored / pending / permanent codes with
   descriptions and a *Search online* button (uses the year and make from the VIN), the
   **freeze frame** saved when the code was set, **smog-check readiness monitors**, and clearing codes.
-- **Vehicle**: year/make, VIN, protocol, battery voltage, adapter version, units setting
-  (US or metric), and a raw command terminal.
+- **Self-tests (Mode 06)**: the car's own pass/fail results for O2 sensors, catalyst, EVAP leak
+  tests, EGR, misfire counts per cylinder…
+- **Vehicle**: year/make, VIN, which modules answer (engine, transmission…), calibration IDs and
+  CVNs (Mode 09), protocol, battery voltage, units setting (US or metric), and a raw command terminal.
 - **Reconnect** to the last adapter with one tap.
 
 ## Project layout

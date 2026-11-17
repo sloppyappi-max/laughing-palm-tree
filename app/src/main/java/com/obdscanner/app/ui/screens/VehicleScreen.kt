@@ -43,7 +43,7 @@ fun VehicleScreen(
     connection: ConnectionState.Connected,
     modifier: Modifier = Modifier,
 ) {
-    LaunchedEffect(Unit) { if (state.vin == null) viewModel.readVehicleInfo() }
+    LaunchedEffect(Unit) { if (state.vehicleInfo == null) viewModel.readVehicleInfo() }
     val info = connection.info
 
     LazyColumn(
@@ -61,6 +61,22 @@ fun VehicleScreen(
                     InfoRow("Adapter", info.elmVersion ?: "Unknown")
                     InfoRow("Connected via", connection.target.label)
                     InfoRow("Supported PIDs", state.supportedPids.size.toString())
+                }
+            }
+        }
+
+        if (info.ecus.isNotEmpty() || state.vehicleInfo != null) {
+            item { SectionTitle("Modules & calibration") }
+            item {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        info.ecus.forEach { ecu -> InfoRow(ecu.name, ecu.header) }
+                        state.vehicleInfo?.let { v ->
+                            v.ecuNames.forEach { InfoRow("Module name", it) }
+                            v.calibrationIds.forEach { InfoRow("Calibration ID", it) }
+                            v.cvns.forEach { InfoRow("CVN", it) }
+                        }
+                    }
                 }
             }
         }

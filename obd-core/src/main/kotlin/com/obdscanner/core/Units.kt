@@ -3,13 +3,14 @@ package com.obdscanner.core
 enum class UnitSystem { METRIC, IMPERIAL }
 
 /** A value ready to show: converted to the chosen unit system. */
-data class DisplayValue(val value: Double, val unit: String, val decimals: Int) {
-    val text: String get() = "%.${decimals}f".format(value)
+data class DisplayValue(val value: Double, val unit: String, val text: String) {
+    constructor(value: Double, unit: String, decimals: Int) : this(value, unit, "%.${decimals}f".format(value))
 }
 
 object Units {
     /** Converts a PID's metric value for display. Pressures become psi, temperatures °F, and so on. */
     fun display(pid: Pid, value: Double, system: UnitSystem): DisplayValue {
+        pid.label?.let { return DisplayValue(value, "", it(value)) }
         if (system == UnitSystem.METRIC) return DisplayValue(value, pid.unit, pid.decimals)
         return when (pid.unit) {
             "°C" -> DisplayValue(value * 9 / 5 + 32, "°F", pid.decimals)
@@ -18,6 +19,7 @@ object Units {
             "kPa" -> DisplayValue(value * 0.1450377, "psi", 1)
             "L/h" -> DisplayValue(value / 3.785412, "gal/h", 2)
             "g/s" -> DisplayValue(value * 0.1322774, "lb/min", 2)
+            "Nm" -> DisplayValue(value * 0.7375621, "lb·ft", 0)
             else -> DisplayValue(value, pid.unit, pid.decimals)
         }
     }
