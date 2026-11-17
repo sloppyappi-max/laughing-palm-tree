@@ -20,6 +20,10 @@ sealed interface AdapterTarget {
         override val label get() = name
     }
 
+    data class Ble(val device: BluetoothDevice, val name: String) : AdapterTarget {
+        override val label get() = "$name (Bluetooth LE)"
+    }
+
     data class Wifi(val host: String = "192.168.0.10", val port: Int = 35000) : AdapterTarget {
         override val label get() = "Wi-Fi $host:$port"
     }

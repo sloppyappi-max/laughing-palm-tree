@@ -6,7 +6,7 @@ through a cheap ELM327 OBD-II adapter (Bluetooth or Wi-Fi).
 ## Features
 
 - **Connect** to a paired Bluetooth ELM327 (with fallbacks for picky clone adapters),
-  a Wi-Fi ELM327 (default `192.168.0.10:35000`), or a **demo car** to try the app with no hardware.
+  a Bluetooth LE adapter (found by scanning), a Wi-Fi ELM327 (default `192.168.0.10:35000`), or a **demo car** to try the app with no hardware.
 - **Dashboard**: RPM and speed gauges plus every supported sensor the app can decode
   (coolant, load, throttle, MAF, MAP, fuel trims, fuel level, voltage, oil temp…).
   Only polls while the screen is visible; fast values refresh every round.
@@ -40,5 +40,9 @@ debug APK as a build artifact (Actions tab → latest run → *obd-scanner-debug
 3. Open the app, allow Bluetooth access, tap the adapter.
    The first connection can take ~10 s while the adapter detects the car's protocol.
 
-Bluetooth **LE** adapters (e.g. some Vgate iCar Pro BLE / OBDLink CX models) are not supported
-yet; classic Bluetooth (SPP) and Wi-Fi adapters are.
+Bluetooth **LE** adapters (Vgate iCar Pro BLE, OBDLink CX, cheap FFF0/FFE0 clones) don't pair in
+system settings: use **Search for devices** under *Bluetooth LE adapter* instead.
+
+If an adapter connects but doesn't answer like an ELM327 (e.g. brand-locked dongles such as the
+Innova 3215RS), the app shows an **adapter diagnostics** report: the GATT services and characteristics
+it offers and every byte exchanged. That report is what's needed to add support for it.

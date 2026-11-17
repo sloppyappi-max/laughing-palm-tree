@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -42,7 +43,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -137,6 +141,11 @@ fun ConnectScreen(state: UiState, viewModel: ObdViewModel) {
                 }
             }
 
+            state.diagnostics?.let { report -> item { DiagnosticsCard(report) } }
+
+            item { SectionTitle("Bluetooth LE adapter") }
+            item { BleSection(state, viewModel, enabled = !connecting) }
+
             item { SectionTitle("Wi-Fi adapter") }
             item { WifiForm(enabled = !connecting, onConnect = viewModel::connectWifi) }
 
@@ -183,4 +192,71 @@ internal fun SectionTitle(text: String) {
 @Composable
 internal fun Hint(text: String) {
     Text(text, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+}
+
+private val blePermissions: Array<String> =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+    } else {
+        arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+    }
+
+/** Scan for Bluetooth LE adapters (e.g. Innova, Vgate iCar Pro BLE, OBDLink CX) and connect to one. */
+@Composable
+private fun BleSection(state: UiState, viewModel: ObdViewModel, enabled: Boolean) {
+    val context = LocalContext.current
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
+        if (results.values.all { it }) viewModel.scanBle()
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Hint("For adapters that don't show up in Bluetooth settings. Plug the adapter in and turn the ignition on first.")
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Button(
+                onClick = {
+                    val missing = blePermissions.filter {
+                        ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
+                    }
+                    if (missing.isEmpty()) viewModel.scanBle() else launcher.launch(missing.toTypedArray())
+                },
+                enabled = enabled && !state.bleScanning && state.bluetoothAvailable,
+            ) { Text(if (state.bleScanning) "Searching…" else "Search for devices") }
+            if (state.bleScanning) {
+                Spacer(Modifier.width(12.dp))
+                CircularProgressIndicator(Modifier.size(20.dp))
+            }
+        }
+        state.bleMessage?.let { Hint(it) }
+        if (!state.bleScanning && state.bleDevices.isEmpty() && state.bleMessage == null) {
+            Hint("No devices listed yet.")
+        }
+        state.bleDevices.forEach { device ->
+            Card(Modifier.fillMaxWidth()) {
+                ListItem(
+                    headlineContent = { Text(device.name) },
+                    supportingContent = { Text("${device.address} · signal ${device.rssi} dBm") },
+                    modifier = Modifier.clickable(enabled = enabled) { viewModel.connectBle(device) },
+                )
+            }
+        }
+    }
+}
+
+/** Shows what an unrecognised Bluetooth LE adapter offered and sent back, ready to copy and share. */
+@Composable
+private fun DiagnosticsCard(report: String) {
+    val clipboard = LocalClipboardManager.current
+    var copied by remember { mutableStateOf(false) }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Adapter diagnostics", style = MaterialTheme.typography.titleMedium)
+            Hint("This adapter didn't answer like an ELM327. Copy this report and share it so support for it can be added.")
+            SelectionContainer {
+                Text(report, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+            }
+            Button(onClick = {
+                clipboard.setText(AnnotatedString(report))
+                copied = true
+            }) { Text(if (copied) "Copied" else "Copy report") }
+        }
+    }
 }
