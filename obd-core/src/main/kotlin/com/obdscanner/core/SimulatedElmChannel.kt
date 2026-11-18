@@ -246,5 +246,17 @@ class SimulatedElmChannel(
         return "$body\r\r"
     }
 
+    /** Simulated Innova VCI: answers the firmware-version frame with a framed reply. */
+    override suspend fun exchangeBytes(data: ByteArray, timeoutMs: Long, complete: (ByteArray) -> Boolean): ByteArray {
+        delay(latencyMs)
+        sent += "BIN " + data.joinToString(" ") { "%02X".format(it) }
+        val frame = InnovaVci.decode(data).first.firstOrNull() ?: return ByteArray(0)
+        return if (frame.payload.contentEquals(byteArrayOf(0x00, 0x05, 0x05))) {
+            InnovaVci.frame(byteArrayOf(0x00, 0x05, 0x05) + "SIM 1.0".toByteArray())
+        } else {
+            ByteArray(0)
+        }
+    }
+
     override fun close() = Unit
 }

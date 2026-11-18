@@ -17,6 +17,14 @@ import java.io.OutputStream
 interface ElmChannel : Closeable {
     suspend fun exchange(command: String, timeoutMs: Long = DEFAULT_TIMEOUT_MS): String
 
+    /**
+     * Sends raw bytes and collects raw bytes until [complete] says the answer is whole or
+     * [timeoutMs] passes; returns whatever arrived (possibly nothing). For adapters with a
+     * binary native protocol, such as Innova's VCI frames.
+     */
+    suspend fun exchangeBytes(data: ByteArray, timeoutMs: Long, complete: (ByteArray) -> Boolean): ByteArray =
+        throw UnsupportedOperationException("This connection doesn't support raw byte exchange")
+
     companion object {
         const val DEFAULT_TIMEOUT_MS = 5_000L
     }
@@ -64,6 +72,28 @@ class StreamElmChannel(
             response.toString()
         }
     }
+
+    override suspend fun exchangeBytes(data: ByteArray, timeoutMs: Long, complete: (ByteArray) -> Boolean): ByteArray =
+        lock.withLock {
+            withContext(Dispatchers.IO) {
+                while (input.available() > 0) input.read()
+                output.write(data)
+                output.flush()
+                val buffer = java.io.ByteArrayOutputStream()
+                val deadline = System.currentTimeMillis() + timeoutMs
+                while (System.currentTimeMillis() < deadline) {
+                    if (input.available() > 0) {
+                        val b = input.read()
+                        if (b < 0) throw IOException("Connection closed by adapter")
+                        buffer.write(b)
+                        if (complete(buffer.toByteArray())) break
+                    } else {
+                        delay(5)
+                    }
+                }
+                buffer.toByteArray()
+            }
+        }
 
     override fun close() {
         runCatching { input.close() }

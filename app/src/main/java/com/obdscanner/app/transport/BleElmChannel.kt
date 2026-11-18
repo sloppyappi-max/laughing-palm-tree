@@ -182,6 +182,19 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
         response.toString().replace("\u0000", "")
     }
 
+    override suspend fun exchangeBytes(data: ByteArray, timeoutMs: Long, complete: (ByteArray) -> Boolean): ByteArray =
+        lock.withLock {
+            failure?.let { throw it }
+            while (incoming.tryReceive().isSuccess) Unit // drop stale data
+            log.traffic("TX", data)
+            write(data)
+            val buffer = java.io.ByteArrayOutputStream()
+            withTimeoutOrNull(timeoutMs) {
+                while (!complete(buffer.toByteArray())) buffer.write(incoming.receive())
+            }
+            buffer.toByteArray()
+        }
+
     private suspend fun write(data: ByteArray) {
         val type = if (writeChar.can(BluetoothGattCharacteristic.PROPERTY_WRITE)) {
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT

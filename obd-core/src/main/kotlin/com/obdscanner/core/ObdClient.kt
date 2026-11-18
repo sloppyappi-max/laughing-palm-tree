@@ -248,7 +248,38 @@ class ObdClient(private val channel: ElmChannel) {
         run("ATSH7E2")
         run("0100") // directly to the transmission
         run("ATH0")
+        appendVciProbe(out)
         out.toString().trimEnd()
+    }
+
+    /**
+     * Innova VCI native protocol: sends only the read-only "get firmware version" frame and shows
+     * the raw reply, to confirm the framing on a real dongle. Then re-applies the ELM327 setup in
+     * case the dongle switched modes. Must run inside [lock].
+     */
+    private suspend fun appendVciProbe(out: StringBuilder) {
+        fun hex(b: ByteArray) = b.joinToString(" ") { "%02X".format(it) }.ifEmpty { "(nothing)" }
+        fun ascii(b: ByteArray) = b.map { (it.toInt() and 0xFF).let { c -> if (c in 0x20..0x7E) c.toChar() else '.' } }.joinToString("")
+        val request = InnovaVci.GET_FW_VERSION
+        out.appendLine("> VCI getFwVersion: ${hex(request)}")
+        val reply = try {
+            channel.exchangeBytes(request, 3_000, InnovaVci::hasCompleteFrame)
+        } catch (e: UnsupportedOperationException) {
+            out.appendLine("(not supported on this connection)")
+            return
+        } catch (e: Exception) {
+            out.appendLine("(${e.message})")
+            return
+        }
+        out.appendLine("raw: ${hex(reply)}")
+        if (reply.isNotEmpty()) out.appendLine("text: ${ascii(reply)}")
+        InnovaVci.decode(reply).first.forEach { f ->
+            out.appendLine("frame${if (f.checksumOk) "" else " (BAD CHECKSUM)"}: ${hex(f.payload)} |${ascii(f.payload)}|")
+        }
+        // Back to text mode: end any partial line, then the app's usual format.
+        headerChanged = true
+        runCatching { sx("", 1_500) }
+        for (cmd in listOf("ATE0", "ATL0", "ATS0", "ATH0")) runCatching { sx(cmd, 1_500) }
     }
 
     /** The Mode 01 PIDs this car supports, from the 0100/0120/0140/… bitmasks. */
