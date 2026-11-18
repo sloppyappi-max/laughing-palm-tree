@@ -124,17 +124,28 @@ Observed (CONFIRMED): three modules answer OBD requests on high-speed CAN — 7E
 | BCM | HS + LS (gateway) | Possible on its HS side — discovery needed |
 | AWD/transfer case | varies | Discovery needed |
 | SDM (airbag) | varies | Discovery needed; **read-only always** |
-| IPC, HVAC, radio, TPMS receiver (often BCM-integrated) | LS‑GMLAN single wire (typical) | **Maybe, through the BCM gateway** — the full scan now tries their high-speed request IDs; the user reports RepairSolutions2 reaches them, which would only be possible over high-speed CAN, so this is worth testing (T5/T8) |
+| IPC, HVAC, radio, TPMS receiver (often BCM-integrated) | LS‑GMLAN single wire, pin 1, 33.3 kbps (REFERENCE, corroborated by user) | **No, not with this dongle.** These modules live on single-wire CAN (pin 1). The 3215RS is an ELM327 v1.3a clone with no SW-CAN transceiver, so it cannot put a frame on that bus. The full scan still tries their high-speed IDs in case a given module is gatewayed, but do not expect the body modules to answer. Reaching them needs SW-CAN hardware (STN1170/STN2120-based, e.g. OBDLink MX+) |
 
-## 6. Bidirectional capability assessment
+## 6. Bidirectional capability assessment (corrected for Global A)
 
-- **Transport:** with `ATSH` the 3215RS can deliver short GMLAN requests to high-speed modules, so frames like `$AE` *could* be sent. Multi-frame requests and the keep-alive timing are untested.
-- **The real blockers are knowledge and authorisation, not bytes:**
-  1. Which `$AE` control bytes drive which output is GM-proprietary. Those bytes will **not** be guessed. Unknown requests to modules are against this project's rules, and a wrong command can move an actuator.
-  2. Many controls require `$27` SecurityAccess (seed/key). The app will not bypass security.
-  3. Outputs need a tester-present kept alive. The ELM 1.3a can't do that in the background, so the app has to send it, and any gap ends the control.
-  4. LS-GMLAN modules (HVAC and probably lighting) are likely physically unreachable (§5).
-- **Plan:** an Active Test Engine that only runs **documented, verified** tests from a reviewed definition file. Each test lists its preconditions (engine off / in Park), a maximum duration, an automatic return-to-normal (`$20`), and module allowlists. SDM and EBCM are excluded from outputs entirely. A test stays at "Unsupported" until it is verified on the car.
+The 2013 Traverse is a **GM Global A** vehicle. Confirmed/accepted facts:
+
+- **No security gateway on the OBD port.** Global A (pre-~2018) has no cyber gateway module between pin 6/14 and the modules, so the tool can address powertrain/chassis modules on high-speed CAN directly. (REFERENCE, corroborated by the user.)
+- **How GM outputs are driven:** UDS `$2F` InputOutputControlByIdentifier, or GMLAN `$AE` DeviceControl.
+- **Why a control gets rejected — and the fix:** the module needs (1) an **extended session** `$10 03`, (2) a **periodic TesterPresent** `$3E` heartbeat (~2 s) for as long as the output is held, and sometimes (3) a **SecurityAccess** `$27` seed/key for protected actuators. Items 1 and 2 are now implemented (`enterExtendedSession`, `testerPresent`, `returnToDefaultSession`, CONFIRMED in tests). Item 3 is discovery-only — the app will not compute keys (see §6b).
+- **Bus routing decides what is even reachable:**
+
+| Actuator group | Bus / pins | Reachable with 3215RS? |
+|---|---|---|
+| Powertrain — cooling fans, EVAP solenoids, injectors, idle | High-speed CAN, pins 6 & 14 | **Transport yes** (session + heartbeat work). Still needs verified `$2F`/`$AE` control IDs and often `$27`. |
+| Body — door locks, windows, wipers, interior lights, HVAC doors | Single-wire CAN (SW-CAN / GMLAN), pin 1, 33.3 kbps | **No.** The 3215RS has no SW-CAN transceiver. Needs STN1170/STN2120-based hardware (e.g. OBDLink MX+). |
+
+**So the ceiling for actuator tests on the 3215RS is: high-speed / powertrain only, with the right session, and only where we have verified command definitions.** Body-actuator tests are a hardware limit, not a software one.
+
+**What the app will and won't send:**
+- It already has the session + heartbeat transport (safe, reversible).
+- It will run output controls **only from a reviewed `ActuatorTest` definition** with preconditions (e.g. engine off / in Park), a maximum hold time, an automatic return-to-normal, and a module allowlist. Airbag (SDM) and brake (EBCM) are excluded from outputs.
+- It will **not** ship guessed `$2F`/`$AE` control bytes. GM's control identifiers are proprietary and vehicle-specific; firing a guessed one can move a real actuator. Each test stays "Unsupported" until its definition is verified against a service source and tested on the car.
 
 ## 6b. GM security access (SecurityAccess, service $27)
 
@@ -178,6 +189,7 @@ Use the newest build each time. Engine running unless noted. Share **Vehicle →
 | T4 | Capability tester (next build): `ATCAF0` + a known request, `ATCRA`, `ATMA` for 2 s, `ATSP` variants | Which ELM features really work (behaviour, not `OK`) |
 | T5 | Read-only identity per address: `$1A 90` / `$1A B0` at 7E0/7E2 and 0x241–0x25F; `$22 F190` | Which modules exist on HS-GMLAN, and whether the VCI filters GM services |
 | T6 | GMLAN `$A9` DTC read per found module | Full-system code read |
+| T9 | On a found powertrain module (7E0/7E2): `enterExtendedSession` then a heartbeat, confirm it stays responsive for ~10 s | Proves the session + TesterPresent transport needed for any bi-directional test |
 | T8 | Full scan, then read each found module's identity and codes; tap **Check security access** | Which modules exist (incl. body modules via gateway), their real names, and which are security-locked (read-only) |
 | T7 | Look into the dongle's plug: is there a metal contact in **pin 1** (top row, far left with the wide side up)? Photo is enough | Dongles usually only populate the pins they use. An empty pin 1 proves no single-wire GMLAN |
 

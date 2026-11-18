@@ -58,3 +58,33 @@ class ModuleScanTest {
         assertTrue("must never send a key", sim.sent.none { it.startsWith("2702") })
     }
 }
+
+/** Diagnostic-session building blocks (UDS 10/3E) used for enhanced reads and output control. */
+class DiagnosticSessionTest {
+    private fun client() = ObdClient(SimulatedElmChannel(latencyMs = 0)).also { runBlocking { it.initialize() } }
+
+    @Test
+    fun entersAndLeavesExtendedSession() = runBlocking {
+        val obd = client()
+        assertTrue(obd.enterExtendedSession(0x7E0))   // 50 03
+        obd.returnToDefaultSession(0x7E0)             // 50 01, must not throw
+    }
+
+    @Test
+    fun testerPresentKeepsSessionAlive() = runBlocking {
+        assertTrue(client().testerPresent(0x7E2))     // 7E positive
+    }
+
+    @Test
+    fun sessionHelpersNeverFireAnActuator() = runBlocking {
+        val sim = SimulatedElmChannel(latencyMs = 0)
+        val obd = ObdClient(sim).also { it.initialize() }
+        sim.sent.clear()
+        obd.enterExtendedSession(0x7E0)
+        obd.testerPresent(0x7E0)
+        obd.returnToDefaultSession(0x7E0)
+        // Only session (10), tester-present (3E) and addressing (AT…) — never output control (2F/AE).
+        val control = sim.sent.filterNot { it.startsWith("AT") }.filter { it.startsWith("2F") || it.startsWith("AE") }
+        assertTrue(control.toString(), control.isEmpty())
+    }
+}

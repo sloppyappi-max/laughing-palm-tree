@@ -170,12 +170,18 @@ class SimulatedElmChannel(
         return when (module) {
             "7E0" -> when (cmd) {
                 "3E00" -> "7E00"
+                "1003" -> "500300324001F4" // extended session, with P2 timing bytes
+                "1001" -> "5001003201F4"    // default session
+
                 "1902FF" -> udsCodes(*stored.map { it to 0x00 }.toTypedArray())
                 "2701" -> "7F2711" // engine computer: no security access
                 else -> "7F" + cmd.take(2) + "31"
             }
             "7E2" -> when (cmd) {
                 "3E00" -> "7E00"
+                "1003" -> "500300324001F4" // extended session, with P2 timing bytes
+                "1001" -> "5001003201F4"    // default session
+
                 "1902FF" -> udsCodes()
                 "22F197" -> hex(0x62, 0xF1, 0x97, *ascii("TCM-6T70", 8))
                 "221940" -> hex(0x62, 0x19, 0x40, (minOf(80.0, 30 + t() * 2) + 40).roundToInt())
@@ -185,6 +191,9 @@ class SimulatedElmChannel(
             }
             "241" -> when (cmd) {
                 "3E00" -> "7E00"
+                "1003" -> "500300324001F4" // extended session, with P2 timing bytes
+                "1001" -> "5001003201F4"    // default session
+
                 "1902FF" -> udsCodes("C0035" to 0x5A)
                 "2701" -> hex(0x67, 0x01, 0x00, 0x00, 0x00, 0x00) // already unlocked (zero seed)
                 else -> "7F" + cmd.take(2) + "31"
@@ -228,7 +237,7 @@ class SimulatedElmChannel(
             cmd.startsWith("ATSH") -> { target = cmd.removePrefix("ATSH"); "OK" }
             broadcastRefused && target == "7DF" && cmd.startsWith("01") -> if (headers) "7E9037F0111" else "7F0111"
             // At 7E0 the engine answers normal OBD requests too; module-only services go to moduleResponse.
-            !cmd.startsWith("AT") && target != "7DF" && (target != "7E0" || cmd.take(2) in setOf("3E", "19", "22", "27", "1A")) ->
+            !cmd.startsWith("AT") && target != "7DF" && (target != "7E0" || cmd.take(2) in setOf("3E", "19", "22", "27", "1A", "10")) ->
                 moduleResponse(target, cmd)
             headers && cmd == "0100" && can11 && target == "7DF" -> "7E806" + hex(0x41, 0x00, *supportMask(0x00)) + "\r7E906" + hex(0x41, 0x00, 0x80, 0, 0, 0)
             headers && cmd == "0100" -> "486B10" + hex(0x41, 0x00, *supportMask(0x00)) + "00"

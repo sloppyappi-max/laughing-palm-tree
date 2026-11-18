@@ -465,6 +465,33 @@ class ObdClient(private val channel: ElmChannel) {
         }?.let { it.copyOfRange(1 + echo.size, it.size) }
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Diagnostic sessions and keep-alive. Enhanced requests to a module are dropped unless the
+    // module is in an extended session (UDS 10 03) and hears a periodic TesterPresent (3E). These
+    // are the standard, reversible building blocks for enhanced reads and (later) output control;
+    // none of them, on their own, moves an actuator.
+    // ---------------------------------------------------------------------------------------
+
+    /** Enters the extended diagnostic session (UDS `10 03`) on a module. True on a positive reply. */
+    suspend fun enterExtendedSession(requestId: Int): Boolean = session {
+        requestFrom(requestId, "1003", timeoutMs = 1_500) != null
+    }
+
+    /** Returns a module to the default session (UDS `10 01`). Best-effort; always safe to call. */
+    suspend fun returnToDefaultSession(requestId: Int) {
+        session { runCatching { requestFrom(requestId, "1001", timeoutMs = 1_000) } }
+    }
+
+    /**
+     * Sends one TesterPresent (`3E 00`) to a module to keep an extended session alive. Call it on a
+     * ~2 s heartbeat for as long as a session must stay open. Read-only; returns true on a positive reply.
+     */
+    suspend fun testerPresent(requestId: Int): Boolean = session {
+        target(requestId)
+        val frames = framesOf(sx("3E00", 800), "3E00")
+        frames.any { it.isNotEmpty() && (it.u(0) == 0x7E || it.u(0) == 0x7F) }
+    }
+
     /** Reads a manufacturer / custom sensor. */
     private suspend fun readCustom(pid: Pid, request: PidRequest): Double? {
         if (!supportsModuleAccess) return null
