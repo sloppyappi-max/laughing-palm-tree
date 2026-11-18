@@ -168,27 +168,53 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
 
     // --- ElmChannel ---
 
+    /**
+     * Some adapters (Innova's ELM327 mode) print a `>` after each module's answer, so one request
+     * can produce several prompts. Once late answers have been seen, wait briefly after each prompt.
+     */
+    @Volatile private var multiPrompt = false
+    private var exchanges = 0
+
     override suspend fun exchange(command: String, timeoutMs: Long): String = lock.withLock {
         failure?.let { throw it }
-        while (incoming.tryReceive().isSuccess) Unit // drop stale data
+        var stale = 0
+        while (true) { // drop stale data
+            val old = incoming.tryReceive().getOrNull() ?: break
+            stale += String(old, Charsets.ISO_8859_1).count { !it.isWhitespace() && it != '>' }
+        }
+        // Leftovers right after connecting can come from the adapter probes, so they don't count.
+        exchanges++
+        if (stale > 0 && !multiPrompt && exchanges > 8) {
+            multiPrompt = true
+            log.add("late answers arrive after the prompt; waiting ${LATE_ANSWER_MS} ms after each one")
+        }
         val bytes = "$command\r".toByteArray(Charsets.US_ASCII)
         log.traffic("TX", bytes)
         write(bytes)
 
         val response = StringBuilder()
-        withTimeoutOrNull(timeoutMs) {
-            while (true) {
-                val chunk = incoming.receive()
-                val text = String(chunk, Charsets.ISO_8859_1)
-                val prompt = text.indexOf('>')
-                if (prompt >= 0) {
-                    response.append(text, 0, prompt)
-                    break
-                }
-                response.append(text)
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var seenPrompt = false
+        var atPrompt = false
+        while (true) {
+            val remaining = deadline - System.currentTimeMillis()
+            val wait = if (atPrompt) minOf(remaining, if (multiPrompt) LATE_ANSWER_MS else 0L) else remaining
+            val chunk = if (wait > 0) withTimeoutOrNull(wait) { incoming.receive() } else incoming.tryReceive().getOrNull()
+            if (chunk == null) {
+                if (seenPrompt) break
+                throw ElmTimeoutException(command)
             }
-        } ?: throw ElmTimeoutException(command)
-        response.toString().replace("\u0000", "")
+            val text = String(chunk, Charsets.ISO_8859_1).replace("\u0000", "")
+            if (seenPrompt && atPrompt && text.any { !it.isWhitespace() && it != '>' } && !multiPrompt) {
+                multiPrompt = true
+                log.add("late answers arrive after the prompt; waiting ${LATE_ANSWER_MS} ms after each one")
+            }
+            response.append(text.replace('>', '\r'))
+            if ('>' in text) seenPrompt = true
+            val end = text.trimEnd()
+            atPrompt = if (end.isEmpty()) atPrompt else end.endsWith('>')
+        }
+        response.toString()
     }
 
     override suspend fun exchangeBytes(data: ByteArray, timeoutMs: Long, complete: (ByteArray) -> Boolean): ByteArray =
@@ -384,6 +410,9 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
     }
 
     companion object {
+        /** How long to wait after a prompt for other modules' answers, once an adapter is known to send them late. */
+        const val LATE_ANSWER_MS = 80L
+
         suspend fun connect(context: Context, device: BluetoothDevice, log: BleLog): ElmChannel {
             val channel = BleElmChannel(log)
             try {

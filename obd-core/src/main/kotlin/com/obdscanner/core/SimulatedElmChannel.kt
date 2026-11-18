@@ -25,6 +25,12 @@ class SimulatedElmChannel(
      * module and the engine computer answers only when addressed directly at 7E0.
      */
     private val broadcastRefused: Boolean = false,
+    /**
+     * True simulates the ELM327 mode of Innova's CodeReader dongles: ATDP answers just "OK", other
+     * modules' answers come as extra lines, and long answers come as a first-frame payload followed
+     * by "2N…" lines that keep their ISO-TP sequence byte.
+     */
+    private val innovaQuirks: Boolean = false,
 ) : ElmChannel {
 
     private var protocolNumber = "0"
@@ -118,6 +124,13 @@ class SimulatedElmChannel(
     /** Formats a CAN message as an ELM327 prints it with headers off (multi-frame if > 7 bytes). */
     private fun canMessage(payload: IntArray): String {
         if (payload.size <= 7) return hex(*payload)
+        if (innovaQuirks) {
+            val lines = mutableListOf(hex(*payload.take(6).toIntArray()))
+            payload.drop(6).chunked(7).forEachIndexed { i, chunk ->
+                lines += "2%X".format((i + 1) % 16) + hex(*chunk.toIntArray()) + "00".repeat(7 - chunk.size)
+            }
+            return lines.joinToString("\r")
+        }
         val lines = mutableListOf("%03X".format(payload.size))
         lines += "0:" + hex(*payload.take(6).toIntArray())
         payload.drop(6).chunked(7).forEachIndexed { i, chunk ->
@@ -196,8 +209,15 @@ class SimulatedElmChannel(
         val body = when {
             cmd == "ATZ" -> "\r\rELM327 v1.5"
             cmd == "ATRV" -> "12.6V"
+            innovaQuirks && cmd == "ATDP" -> "OK"
+            innovaQuirks && cmd == "ATDPN" -> "A0"
             cmd == "ATDP" -> "AUTO, $protocol"
             cmd == "ATDPN" -> if (can11) "A6" else "A3"
+            // Another module answers first, with a line of its own; readiness must come from the engine.
+            innovaQuirks && !headers && target == "7DF" && cmd == "0101" ->
+                "410100040000\r" + (pidBytes(0x01)?.let { hex(0x41, 0x01, *it) } ?: "")
+            innovaQuirks && !headers && target == "7DF" && cmd == "0100" ->
+                "410080000001\r" + hex(0x41, 0x00, *supportMask(0x00))
             cmd == "ATI" -> "ELM327 v1.5"
             cmd == "ATH1" -> { headers = true; "OK" }
             cmd == "ATH0" -> { headers = false; "OK" }

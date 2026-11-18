@@ -153,12 +153,16 @@ class ObdClient(private val channel: ElmChannel) {
         }
         if (!responding) send("ATSP0") // leave the adapter searching automatically
 
-        val protocol = if (responding) at("ATDP")?.removePrefix("AUTO, ") else null
-        supportsModuleAccess = protocol?.contains("11/") == true
+        // Some clones (e.g. Innova's ELM327 mode) answer ATDP with just "OK"; then the protocol is
+        // worked out from the reply headers instead.
+        val reported = if (responding) at("ATDP")?.removePrefix("AUTO, ")?.takeIf(::isProtocolName) else null
+        val ecus = if (responding) runCatching { discoverEcus() }.getOrDefault(emptyList()) else emptyList()
+        val protocol = reported ?: protocolFromHeaders(ecus)
+        supportsModuleAccess = protocol?.contains("11/") == true || protocol?.contains("11-bit") == true
         isCan = protocol?.contains("15765") == true || protocol?.contains("CAN") == true
 
         return AdapterInfo(
-            ecus = if (responding) runCatching { discoverEcus() }.getOrDefault(emptyList()) else emptyList(),
+            ecus = ecus,
             elmVersion = elmVersion,
             protocol = protocol,
             batteryVoltage = batteryVoltage(),
@@ -199,6 +203,17 @@ class ObdClient(private val channel: ElmChannel) {
         val data = (query(0x01, pid.code) as? ObdResponse.Data)?.matching(0x01, pid.code)?.firstOrNull() ?: return null
         val payload = IntArray(data.size - 2) { data.u(it + 2) }
         return runCatching { pid.decode(payload) }.getOrNull()
+    }
+
+    private fun isProtocolName(text: String): Boolean =
+        listOf("ISO", "SAE", "J1850", "J1939", "CAN", "KWP").any { text.contains(it, ignoreCase = true) }
+
+    /** 7E8-style reply IDs mean 11-bit CAN, 18DAF1xx means 29-bit CAN. */
+    private fun protocolFromHeaders(ecus: List<Ecu>): String? = when {
+        ecus.isEmpty() -> null
+        ecus.all { it.header.length == 3 } -> "ISO 15765-4 (CAN 11-bit)"
+        ecus.all { it.header.length == 8 } -> "ISO 15765-4 (CAN 29-bit)"
+        else -> null
     }
 
     private fun summary(raw: String) = ElmResponseParser.lines(raw, "0100").joinToString(" | ").ifEmpty { "(empty)" }

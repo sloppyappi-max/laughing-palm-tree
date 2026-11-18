@@ -69,7 +69,7 @@ class ObdClientTest {
             override fun flush() { answer = ByteArrayInputStream("41 0D 32\r\r>".toByteArray()) }
         }
         val channel = StreamElmChannel(input, out)
-        assertEquals("41 0D 32\r\r", channel.exchange("010D"))
+        assertEquals("41 0D 32\r\r\r", channel.exchange("010D"))
         assertEquals("010D\r", out.toString())
     }
 

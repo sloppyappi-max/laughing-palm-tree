@@ -59,9 +59,43 @@ object ElmResponseParser {
             multiFrame = null
         }
 
+        // Raw ISO-TP frames: headers on ("7E8 10 14 49 02 …" then "7E8 21 …"), keyed by sender.
+        val isoTp = LinkedHashMap<String, Pair<Int, java.io.ByteArrayOutputStream>>() // header -> (length, data)
+        // Innova-style headers-off output: the first frame without its PCI bytes, then each
+        // consecutive frame with its "2N" sequence byte still in front ("490201…", "21…", "22…").
+        var openMessage: java.io.ByteArrayOutputStream? = null
+        var nextSequence = 1
+
+        fun finishOpenMessage() {
+            openMessage?.let { messages += it.toByteArray() }
+            openMessage = null
+        }
+
         for (rawLine in lines) {
             val line = rawLine.replace(" ", "")
             val frameMatch = canFrameLine.matchEntire(line)
+            val headerFrame = if (hexLine.matches(line)) isoTpFrame(line) else null
+            if (headerFrame != null) {
+                finishMultiFrame(); finishOpenMessage()
+                val (header, bytes) = headerFrame
+                val pci = bytes.u(0)
+                when (pci shr 4) {
+                    1 -> if (bytes.size >= 2) {
+                        val buffer = java.io.ByteArrayOutputStream().apply { write(bytes, 2, bytes.size - 2) }
+                        isoTp[header] = (((pci and 0x0F) shl 8) or bytes.u(1)) to buffer
+                    }
+                    2 -> isoTp[header]?.second?.write(bytes, 1, bytes.size - 1)
+                }
+                continue
+            }
+            val continuation = openMessage != null && hexLine.matches(line) && line.length % 2 == 0 &&
+                line.length in 4..16 && line[0] == '2' && line[1].digitToInt(16) == nextSequence % 16
+            if (continuation) {
+                openMessage!!.write(hexToBytes(line.substring(2)))
+                nextSequence++
+                continue
+            }
+            finishOpenMessage()
             when {
                 // ISO 15765 multi-frame, headers off: "014" then "0:...", "1:..."
                 canLengthLine.matches(line) -> {
@@ -77,12 +111,24 @@ object ElmResponseParser {
                 }
                 hexLine.matches(line) && line.length % 2 == 0 -> {
                     finishMultiFrame()
-                    messages += hexToBytes(line)
+                    val bytes = hexToBytes(line)
+                    // A full first-frame payload (6 bytes) may be followed by "21…" continuation lines.
+                    if (bytes.size == 6) {
+                        openMessage = java.io.ByteArrayOutputStream().apply { write(bytes) }
+                        nextSequence = 1
+                    } else {
+                        messages += bytes
+                    }
                 }
                 else -> Unit // ignore unrecognised noise
             }
         }
         finishMultiFrame()
+        finishOpenMessage()
+        for ((length, data) in isoTp.values) {
+            val bytes = data.toByteArray()
+            messages += bytes.copyOf(minOf(length, bytes.size))
+        }
 
         // Negative responses (7F <mode> <code>) mean the ECU rejected the request.
         val positive = messages.filterNot { it.isNotEmpty() && it.u(0) == 0x7F }
@@ -105,6 +151,25 @@ object ElmResponseParser {
         val length = rest.u(0)
         if (length !in 1..7 || length > rest.size - 1) return null
         return rest.copyOfRange(1, 1 + length)
+    }
+
+    /**
+     * A first or consecutive ISO-TP frame printed with its 11-bit header (`7E8 10 14 …`, `7E8 21 …`):
+     * returns (header, frame bytes starting at the PCI byte). Single frames are left to [stripCanHeader].
+     */
+    private fun isoTpFrame(line: String): Pair<String, ByteArray>? {
+        val headerLength = when {
+            line.length % 2 == 1 && line.length >= 7 && line[0] == '7' -> 3
+            line.length >= 14 && line.startsWith("18DA") -> 8
+            else -> return null
+        }
+        val bytes = hexToBytes(line.substring(headerLength))
+        if (bytes.size < 2 || bytes.size > 8) return null
+        return when (bytes.u(0) shr 4) {
+            1 -> if (bytes.size == 8) line.substring(0, headerLength) to bytes else null
+            2 -> line.substring(0, headerLength) to bytes
+            else -> null
+        }
     }
 
     fun hexToBytes(hex: String): ByteArray {

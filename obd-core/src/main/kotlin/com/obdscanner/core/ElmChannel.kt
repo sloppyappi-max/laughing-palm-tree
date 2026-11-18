@@ -46,26 +46,47 @@ class StreamElmChannel(
 ) : ElmChannel {
 
     private val lock = Mutex()
+    @Volatile private var multiPrompt = false
 
     override suspend fun exchange(command: String, timeoutMs: Long): String = lock.withLock {
         withContext(Dispatchers.IO) {
-            // Drop anything left over from a previous, timed-out command.
-            while (input.available() > 0) input.read()
+            // Drop anything left over from a previous, timed-out command (or a late answer).
+            var stale = false
+            while (input.available() > 0) if (input.read().toChar().let { !it.isWhitespace() && it != '>' }) stale = true
+            if (stale) multiPrompt = true
 
             output.write("$command\r".toByteArray(Charsets.US_ASCII))
             output.flush()
 
             val response = StringBuilder()
             val deadline = System.currentTimeMillis() + timeoutMs
+            var seenPrompt = false
+            // Some adapters print a '>' after each module's answer: after a prompt, keep reading
+            // whatever is already waiting (and briefly wait for more once late answers were seen).
+            var promptAt = 0L
             while (true) {
                 if (input.available() > 0) {
                     val b = input.read()
                     if (b < 0) throw IOException("Connection closed by adapter")
                     val c = b.toChar()
-                    if (c == '>') break
-                    if (b != 0) response.append(c) // some clones emit NUL bytes
+                    when {
+                        c == '>' -> { seenPrompt = true; promptAt = System.currentTimeMillis(); response.append('\r') }
+                        b == 0 -> Unit // some clones emit NUL bytes
+                        else -> {
+                            if (!c.isWhitespace()) {
+                                if (promptAt != 0L) multiPrompt = true // another module's answer after a prompt
+                                promptAt = 0L
+                            }
+                            response.append(c)
+                        }
+                    }
                 } else {
-                    if (System.currentTimeMillis() > deadline) throw ElmTimeoutException(command)
+                    val now = System.currentTimeMillis()
+                    if (seenPrompt && promptAt != 0L && (!multiPrompt || now - promptAt >= LATE_ANSWER_MS)) break
+                    if (now > deadline) {
+                        if (seenPrompt) break
+                        throw ElmTimeoutException(command)
+                    }
                     delay(5)
                 }
             }
@@ -94,6 +115,10 @@ class StreamElmChannel(
                 buffer.toByteArray()
             }
         }
+
+    companion object {
+        const val LATE_ANSWER_MS = 80L
+    }
 
     override fun close() {
         runCatching { input.close() }
