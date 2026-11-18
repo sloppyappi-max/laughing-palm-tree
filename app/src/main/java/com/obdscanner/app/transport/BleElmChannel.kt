@@ -108,6 +108,11 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
     @Volatile private var pendingWrite: CompletableDeferred<Boolean>? = null
     @Volatile private var failure: IOException? = null
     @Volatile private var pendingMtu: CompletableDeferred<Int>? = null
+    @Volatile private var pendingRead: CompletableDeferred<ByteArray?>? = null
+
+    /** Standard Device Information service (0x180A) values, read once after connecting. Read-only. */
+    var deviceInfo: Map<String, String> = emptyMap()
+        private set
 
     private val incoming = Channel<ByteArray>(Channel.UNLIMITED)
     private val lock = Mutex()
@@ -140,6 +145,18 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
 
     override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
         pendingMtu?.complete(mtu)
+    }
+
+    override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray, status: Int) {
+        pendingRead?.complete(if (status == BluetoothGatt.GATT_SUCCESS) value else null)
+    }
+
+    @Deprecated("Used on Android 12 and lower")
+    override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
+        @Suppress("DEPRECATION")
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            pendingRead?.complete(if (status == BluetoothGatt.GATT_SUCCESS) c.value else null)
+        }
     }
 
     override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) {
@@ -275,6 +292,8 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
             for (c in service.characteristics) log.add("  char ${c.uuid} [${describeProperties(c)}]")
         }
 
+        readDeviceInformation()
+
         // Bigger packets help adapters that send whole answers at once; ignore if refused.
         val mtu = CompletableDeferred<Int>()
         pendingMtu = mtu
@@ -312,6 +331,26 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
             "Connected, but the adapter didn't answer like an ELM327 on any channel. " +
                 "Copy the diagnostics report below and share it so support for it can be added.",
         )
+    }
+
+    /** Reads the standard Device Information characteristics (GATT reads only; nothing is written). */
+    private suspend fun readDeviceInformation() {
+        val service = gatt.getService(DEVICE_INFO_SERVICE) ?: return
+        val found = LinkedHashMap<String, String>()
+        for ((short, label) in DEVICE_INFO_FIELDS) {
+            val c = service.getCharacteristic(UUID.fromString("0000$short-0000-1000-8000-00805f9b34fb")) ?: continue
+            if (!c.can(BluetoothGattCharacteristic.PROPERTY_READ)) continue
+            val done = CompletableDeferred<ByteArray?>()
+            pendingRead = done
+            if (!gatt.readCharacteristic(c)) continue
+            val value = withTimeoutOrNull(2_000) { done.await() } ?: continue
+            val text = String(value, Charsets.ISO_8859_1).trim { it <= ' ' }
+            val printable = text.all { it in ' '..'~' }
+            found[label] = if (printable && text.isNotEmpty()) text else value.joinToString(" ") { "%02X".format(it) }
+            log.add("device info $label: ${found[label]}")
+        }
+        pendingRead = null
+        deviceInfo = found
     }
 
     /** Notify/write pairs worth trying: known adapter layouts first, then every other plausible pair. */
@@ -412,6 +451,13 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
     companion object {
         /** How long to wait after a prompt for other modules' answers, once an adapter is known to send them late. */
         const val LATE_ANSWER_MS = 80L
+
+        private val DEVICE_INFO_SERVICE: UUID = UUID.fromString("0000180a-0000-1000-8000-00805f9b34fb")
+        private val DEVICE_INFO_FIELDS = listOf(
+            "2a29" to "manufacturer", "2a24" to "model number", "2a25" to "serial number",
+            "2a27" to "hardware revision", "2a26" to "firmware revision", "2a28" to "software revision",
+            "2a23" to "system ID", "2a50" to "PnP ID",
+        )
 
         suspend fun connect(context: Context, device: BluetoothDevice, log: BleLog): ElmChannel {
             val channel = BleElmChannel(log)
