@@ -93,6 +93,7 @@ fun VehicleScreen(
 
         item { SectionTitle("Advanced") }
         item { AdapterTestCard(state, onRun = viewModel::runAdapterTest) }
+        item { FirmwareCard(state, onRun = viewModel::readFirmware) }
         item { IdExplorerCard(state, viewModel) }
 
         item { SectionTitle("Terminal (advanced)") }

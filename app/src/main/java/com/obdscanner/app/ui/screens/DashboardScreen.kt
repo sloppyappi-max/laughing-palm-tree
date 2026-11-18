@@ -495,3 +495,40 @@ internal fun AdapterTestCard(state: UiState, onRun: () -> Unit) {
         }
     }
 }
+
+/** Reads the adapter's own firmware / hardware identity (read-only). Not a firmware dump — see the note. */
+@Composable
+internal fun FirmwareCard(state: UiState, onRun: () -> Unit) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Adapter firmware & identity", style = MaterialTheme.typography.titleSmall)
+            Hint(
+                "Reads everything the adapter safely reports about itself: its Bluetooth device info " +
+                    "(firmware, hardware and software revision, serial), its GATT services, and a read-only " +
+                    "native firmware query. It reads identity only — it can't pull a full firmware image off " +
+                    "this adapter, and it never sends update or bootloader commands.",
+            )
+            OutlinedButton(onClick = onRun, enabled = !state.firmwareRunning) {
+                Text(if (state.firmwareRunning) "Reading…" else "Read firmware info")
+            }
+            state.firmwareReport?.let { report ->
+                SelectionContainer {
+                    Text(report, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { clipboard.setText(AnnotatedString(report)) }) { Text("Copy") }
+                    TextButton(onClick = {
+                        val send = Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_SUBJECT, "OBD Scanner adapter firmware & identity")
+                            putExtra(Intent.EXTRA_TEXT, report)
+                        }
+                        context.startActivity(Intent.createChooser(send, "Share firmware info"))
+                    }) { Text("Share") }
+                }
+            }
+        }
+    }
+}

@@ -297,6 +297,42 @@ class ObdClient(private val channel: ElmChannel) {
         for (cmd in listOf("ATE0", "ATL0", "ATS0", "ATH0")) runCatching { sx(cmd, 1_500) }
     }
 
+    /**
+     * Read-only VCI firmware / identity probe for adapters that speak Innova's native protocol:
+     * sends only the documented, read-only "get firmware version" (SYS 05) and "get product id"
+     * (SYS 04) queries and returns their raw replies. It sends nothing that writes, updates, reboots
+     * or reconfigures the dongle (enforced by [InnovaVci.assertSafe]). Empty replies mean the adapter
+     * did not answer the native protocol — e.g. an ELM327 clone that only understands text, which is
+     * what the 3215RS has done so far. This reads firmware *identity*, not a flashable image: the
+     * adapter exposes no interface over Bluetooth that streams its firmware binary out.
+     */
+    suspend fun vciFirmwareProbe(): String = lock.withLock {
+        fun hex(b: ByteArray) = b.joinToString(" ") { "%02X".format(it) }.ifEmpty { "(nothing)" }
+        fun ascii(b: ByteArray) = b.map { (it.toInt() and 0xFF).let { c -> if (c in 0x20..0x7E) c.toChar() else '.' } }.joinToString("")
+        val out = StringBuilder()
+        suspend fun probe(label: String, request: ByteArray) {
+            InnovaVci.assertSafe(request) // never send anything but the read-only queries
+            out.appendLine("> $label: ${hex(request)}")
+            val reply = try {
+                channel.exchangeBytes(request, 3_000, InnovaVci::hasCompleteReply)
+            } catch (e: UnsupportedOperationException) {
+                out.appendLine("(this connection has no raw byte channel)"); return
+            } catch (e: Exception) {
+                out.appendLine("(${e.message})"); return
+            }
+            if (reply.isEmpty()) { out.appendLine("no native reply (adapter did not answer the native protocol)"); return }
+            out.appendLine("raw: ${hex(reply)}")
+            InnovaVci.replies(reply).forEach { f -> out.appendLine("payload: ${hex(f.payload)} |${ascii(f.payload)}|") }
+        }
+        probe("getFwVersion (SYS 05)", InnovaVci.GET_FW_VERSION)
+        probe("getProductId (SYS 04)", InnovaVci.GET_GUID_PRODUCT_ID)
+        // Back to text mode in case the adapter switched: end any partial line, re-apply the setup.
+        headerChanged = true
+        runCatching { sx("", 1_500) }
+        for (cmd in listOf("ATE0", "ATL0", "ATS0", "ATH0")) runCatching { sx(cmd, 1_500) }
+        out.toString().trimEnd()
+    }
+
     /** The Mode 01 PIDs this car supports, from the 0100/0120/0140/… bitmasks. */
     suspend fun supportedPids(): Set<Int> = supportedBitmask(0x01, last = 0xC0)
 

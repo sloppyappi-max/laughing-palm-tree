@@ -159,9 +159,29 @@ The 2013 Traverse is a **GM Global A** vehicle. Confirmed/accepted facts:
 
 ## 7. Firmware assessment
 
-- An official update path exists inside RepairSolutions2 (STATIC). Whether the images are signed is UNKNOWN, and it doesn't need to be known.
-- **Firmware modification is not necessary** for anything that can be fixed in software. The ELM interface already allows arbitrary single-frame requests to 11‑bit IDs. The hard limits (no single-wire CAN transceiver, no proprietary control data, security access) are **not** solved by firmware changes.
-- This app never sends upgrade, bootloader, reboot, database-write or ID-write commands (enforced in `InnovaVci.assertSafe`, which has a unit test). If the dongle needs an update, use RepairSolutions2.
+**Can the app extract the adapter's firmware?** It extracts firmware *identity*, not a flashable
+image — and that distinction is a hardware fact, not a software limit.
+
+The app now has a **"Read firmware info"** button (Vehicle tab) that collects, read-only:
+- the standard Bluetooth **Device Information** service (0x180A): firmware revision, hardware
+  revision, software revision, serial, manufacturer, model;
+- the **GATT service map** (shows whether any DFU/OTA firmware-transfer service is exposed — on the
+  3215RS, none is);
+- a **native identity probe** (`getFwVersion` SYS 05, `getProductId` SYS 04), read-only.
+
+**Why a full firmware binary cannot be dumped from here:**
+- The 3215RS exposes only four GATT services (0x1800, 0x1801, 0xFFF0, 0x180A). There is **no DFU/OTA
+  service and no documented read-out command** on its Bluetooth interface, so there is no channel to
+  stream the firmware image out.
+- Its upload path (RS2's `CMD_UPGRADE` 0x07 and bootloader commands) is **write-only** and is on the
+  app's forbidden list (`InnovaVci.assertSafe`) — it is for flashing, not reading, and blindly
+  entering a bootloader can brick the adapter. The app never sends it.
+- A true dump would need the chip's debug port (SWD/JTAG) or a vendor tool. The MCU's read-out
+  protection is almost certainly enabled on a shipping product, so even with hardware access the
+  image may not come off. This is outside the app and risks destroying the adapter, so it is not done.
+
+**Verdict:** firmware *identity* is CONFIRMED-extractable (read-only, in-app). A firmware *image*
+dump is UNSUPPORTED on this hardware over Bluetooth, and no software change removes that.
 
 ## 8. Proposed architecture (keep everything that works)
 

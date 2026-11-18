@@ -88,3 +88,25 @@ class DiagnosticSessionTest {
         assertTrue(control.toString(), control.isEmpty())
     }
 }
+
+/** The read-only firmware/identity probe reads identity and never sends a dongle-changing frame. */
+class FirmwareProbeTest {
+    @Test
+    fun readsNativeIdentityAndSendsOnlySafeFrames() = runBlocking {
+        val dongle = FakeInnovaDongle()
+        val report = ObdClient(InnovaNativeChannel(dongle)).vciFirmwareProbe()
+        assertTrue(report, report.contains("FAKE 1.0"))
+        assertTrue(report, report.contains("SYS 05") && report.contains("SYS 04"))
+        // Exactly the two read-only SYS queries went out as native frames — nothing else.
+        assertEquals(2, dongle.received.size)
+        assertTrue(dongle.received.all { (it[5].toInt() and 0xFF) == InnovaVci.CMD_SYSTEM })
+        assertTrue("must never send a forbidden frame", dongle.received.none { (it[5].toInt() and 0xFF) in InnovaVci.FORBIDDEN_COMMANDS })
+    }
+
+    @Test
+    fun reportsGracefullyWhenNoNativeReply() = runBlocking {
+        // A plain ELM327 clone that never answers the native protocol: the probe must not throw.
+        val report = ObdClient(SimulatedElmChannel(latencyMs = 0)).vciFirmwareProbe()
+        assertTrue(report, report.contains("SYS 05"))
+    }
+}

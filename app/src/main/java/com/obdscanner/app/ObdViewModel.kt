@@ -124,6 +124,9 @@ data class UiState(
     val adapterTestRunning: Boolean = false,
     /** Raw output of the adapter test, for troubleshooting. */
     val adapterReport: String? = null,
+    val firmwareRunning: Boolean = false,
+    /** Firmware & hardware identity report (Device Information + native probe), for troubleshooting. */
+    val firmwareReport: String? = null,
 ) {
     val units: UnitSystem get() = settings.units
     val favorites: List<Int> get() = settings.favorites
@@ -192,6 +195,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Bluetooth LE link log of the current connection (services, characteristics, first traffic). */
     private var bleLog: BleLog? = null
+    private var bleChannel: BleElmChannel? = null
     private var client: ObdClient? = null
     private var connectJob: Job? = null
     private var pollJob: Job? = null
@@ -454,6 +458,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         connect(AdapterTarget.Ble(remote, device.name), saved, diagnostics = log::text) {
             val ble = BleElmChannel.connect(getApplication<Application>(), remote, log)
             bleLog = log
+            bleChannel = ble as? BleElmChannel
             // Innova dongles that answer their native protocol get an ELM327 layer on top, so the
             // rest of the app works unchanged.
             if ((ble as? BleElmChannel)?.isInnovaNative == true) InnovaNativeChannel(ble) { log.add(it) } else ble
@@ -575,6 +580,43 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Extracts every piece of firmware / hardware identity the adapter safely exposes: the standard
+     * Bluetooth Device Information (0x180A), the GATT service map, and a read-only native firmware
+     * probe. It reads identity only — the adapter exposes no interface to stream a flashable firmware
+     * image, and the app never sends update/bootloader commands.
+     */
+    fun readFirmware() {
+        val obd = client ?: return
+        if (_state.value.firmwareRunning) return
+        launchForConnection {
+            _state.update { it.copy(firmwareRunning = true) }
+            val nativeProbe = runCatching { obd.vciFirmwareProbe() }.getOrElse { e ->
+                if (e is CancellationException) throw e
+                if (failIfLinkLost(e)) return@launchForConnection
+                "Firmware probe failed: ${e.message}"
+            }
+            ensureActive()
+            val info = (_state.value.connection as? ConnectionState.Connected)?.info
+            val deviceInfo = bleChannel?.deviceInfo?.takeIf { it.isNotEmpty() }
+                ?.entries?.joinToString("\n") { (k, v) -> "  $k: $v" }
+            val report = listOfNotNull(
+                "VCI firmware & hardware identity",
+                deviceInfo?.let { "Device Information (Bluetooth 0x180A, read-only):\n$it" }
+                    ?: "Device Information (0x180A): none reported (or not a Bluetooth LE connection).",
+                info?.elmVersion?.let { "Adapter firmware string (ATI): $it" },
+                bleLog?.text()?.let { "Bluetooth GATT map:\n$it" },
+                "Native identity probe (read-only):\n$nativeProbe",
+                "Note: this reads firmware identity only. The adapter exposes no Bluetooth interface " +
+                    "that streams its firmware binary out (no DFU/OTA service, and no documented read-out " +
+                    "command), so a full firmware image cannot be dumped from here. The app never sends " +
+                    "update, bootloader or reboot commands. A full dump would need the vendor's own tools " +
+                    "or chip-level hardware access, which is outside this app and can brick the adapter.",
+            ).joinToString("\n\n")
+            _state.update { it.copy(firmwareRunning = false, firmwareReport = report) }
+        }
+    }
+
     fun disconnect() {
         resetConnectionJobs()
         stopRecording()
@@ -601,6 +643,8 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                 diagnostics = null,
                 adapterReport = null,
                 adapterTestRunning = false,
+                firmwareReport = null,
+                firmwareRunning = false,
                 vehicleRetrying = false,
             )
         }
@@ -610,6 +654,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         runCatching { channel?.close() }
         channel = null
         bleLog = null
+        bleChannel = null
         client = null
     }
 
