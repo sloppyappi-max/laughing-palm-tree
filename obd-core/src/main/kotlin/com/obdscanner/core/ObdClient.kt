@@ -231,7 +231,8 @@ class ObdClient(private val channel: ElmChannel) {
             out.appendLine(ElmResponseParser.lines(answer, cmd).joinToString("\n").ifEmpty { "(empty)" })
         }
         headerChanged = true // restore header and filters on the next normal request
-        for (cmd in listOf("ATI", "AT@1", "ATRV", "ATDP", "ATDPN")) run(cmd)
+        // Identification and status only — nothing that writes settings.
+        for (cmd in listOf("ATI", "AT@1", "AT@2", "STI", "STDI", "ATRV", "ATDP", "ATDPN", "ATCS", "ATPPS")) run(cmd)
         run("ATSH7DF")
         run("0100", 10_000) // the normal OBD-II broadcast
         run("ATH1")
