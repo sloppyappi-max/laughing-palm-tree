@@ -29,6 +29,7 @@ import com.obdscanner.core.UnitSystem
 import com.obdscanner.core.DtcType
 import com.obdscanner.core.ElmChannel
 import com.obdscanner.core.ElmTimeoutException
+import com.obdscanner.core.InnovaNativeChannel
 import com.obdscanner.core.MonitorStatus
 import com.obdscanner.core.ObdClient
 import com.obdscanner.core.Pid
@@ -422,7 +423,11 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         val log = BleLog()
         val saved = SavedAdapter(SavedAdapter.Kind.BLE, device.name, device.address)
         connect(AdapterTarget.Ble(remote, device.name), saved, diagnostics = log::text) {
-            BleElmChannel.connect(getApplication<Application>(), remote, log).also { bleLog = log }
+            val ble = BleElmChannel.connect(getApplication<Application>(), remote, log)
+            bleLog = log
+            // Innova dongles that answer their native protocol get an ELM327 layer on top, so the
+            // rest of the app works unchanged.
+            if ((ble as? BleElmChannel)?.isInnovaNative == true) InnovaNativeChannel(ble) { log.add(it) } else ble
         }
     }
 

@@ -263,7 +263,7 @@ class ObdClient(private val channel: ElmChannel) {
         val request = InnovaVci.GET_FW_VERSION
         out.appendLine("> VCI getFwVersion: ${hex(request)}")
         val reply = try {
-            channel.exchangeBytes(request, 3_000, InnovaVci::hasCompleteFrame)
+            channel.exchangeBytes(request, 3_000, InnovaVci::hasCompleteReply)
         } catch (e: UnsupportedOperationException) {
             out.appendLine("(not supported on this connection)")
             return
@@ -273,8 +273,8 @@ class ObdClient(private val channel: ElmChannel) {
         }
         out.appendLine("raw: ${hex(reply)}")
         if (reply.isNotEmpty()) out.appendLine("text: ${ascii(reply)}")
-        InnovaVci.decode(reply).first.forEach { f ->
-            out.appendLine("frame${if (f.checksumOk) "" else " (BAD CHECKSUM)"}: ${hex(f.payload)} |${ascii(f.payload)}|")
+        InnovaVci.replies(reply).forEach { f ->
+            out.appendLine("native reply frame: ${hex(f.payload)} |${ascii(f.payload)}|")
         }
         // Back to text mode: end any partial line, then the app's usual format.
         headerChanged = true

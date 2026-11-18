@@ -252,7 +252,9 @@ class SimulatedElmChannel(
         sent += "BIN " + data.joinToString(" ") { "%02X".format(it) }
         val frame = InnovaVci.decode(data).first.firstOrNull() ?: return ByteArray(0)
         return if (frame.payload.contentEquals(byteArrayOf(0x00, 0x05, 0x05))) {
-            InnovaVci.frame(byteArrayOf(0x00, 0x05, 0x05) + "SIM 1.0".toByteArray())
+            // Reply format: EA b1 lenLo lenHi | 4 header bytes | body
+            val payload = byteArrayOf(0x00, 0x05, 0x00, 0x00) + "SIM 1.0".toByteArray()
+            byteArrayOf(0xEA.toByte(), 0, payload.size.toByte(), 0) + payload
         } else {
             ByteArray(0)
         }

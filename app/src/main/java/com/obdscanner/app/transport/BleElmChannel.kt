@@ -96,6 +96,10 @@ private fun describeProperties(c: BluetoothGattCharacteristic): String = buildLi
 class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, BluetoothGattCallback() {
 
     private lateinit var gatt: BluetoothGatt
+
+    /** True when the adapter answered Innova's native protocol; wrap it in InnovaNativeChannel. */
+    var isInnovaNative = false
+        private set
     private lateinit var writeChar: BluetoothGattCharacteristic
 
     private val connected = CompletableDeferred<Unit>()
@@ -248,13 +252,18 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
         // Bigger packets help adapters that send whole answers at once; ignore if refused.
         val mtu = CompletableDeferred<Int>()
         pendingMtu = mtu
-        if (gatt.requestMtu(247)) withTimeoutOrNull(2_000) { mtu.await() }?.let { log.add("mtu $it") }
+        // RepairSolutions2 uses 185 for Innova dongles.
+        val mtuSize = if (INNOVA_NAME.containsMatchIn(runCatching { device.name }.getOrNull().orEmpty())) 185 else 247
+        if (gatt.requestMtu(mtuSize)) withTimeoutOrNull(2_000) { mtu.await() }?.let { log.add("mtu $it") }
 
         val candidates = candidateLinks()
         if (candidates.isEmpty()) throw IOException("This device has no characteristics that look like a serial data link.")
 
         val name = runCatching { device.name }.getOrNull().orEmpty()
-        if (INNOVA_NAME.containsMatchIn(name)) probeInnovaNativeFirst(candidates.first())
+        if (INNOVA_NAME.containsMatchIn(name) && probeInnovaNative(candidates.first())) {
+            isInnovaNative = true
+            return
+        }
 
         // Brand dongles (Innova, BlueDriver-style…) can expose several data services. Try each and keep
         // the one that answers a harmless "identify" command (ATI) like an ELM327 does.
@@ -281,12 +290,12 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
 
     /** Notify/write pairs worth trying: known adapter layouts first, then every other plausible pair. */
     /**
-     * Innova dongles answer AT commands in a limited ELM327 mode and seem to pick that mode from the
-     * first data they receive. Before any text, send the native read-only "get firmware version"
-     * frame and log any answer. Variants differ only in write type and checksum style; the
-     * command is always the same read-only request.
+     * Innova dongles: RepairSolutions2 writes nothing after connecting except native frames, the
+     * first being AUTOLINK. Before any text, send the read-only "get firmware version" frame and
+     * then AUTOLINK; a reply starting with 0xEA means the dongle speaks the native protocol.
+     * Returns true if it did (the link pair stays selected for the session).
      */
-    private suspend fun probeInnovaNativeFirst(link: Pair<BluetoothGattCharacteristic, BluetoothGattCharacteristic>) {
+    private suspend fun probeInnovaNative(link: Pair<BluetoothGattCharacteristic, BluetoothGattCharacteristic>): Boolean {
         val (notify, write) = link
         log.add("Innova native probe (before any text) on notify=${notify.uuid} write=${write.uuid}")
         try {
@@ -294,26 +303,22 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
             writeChar = write
         } catch (e: IOException) {
             log.add("native probe: could not set up (${e.message})")
-            return
+            return false
         }
-        val payload = byteArrayOf(0x00, InnovaVci.CMD_SYSTEM.toByte(), InnovaVci.SYSTEM_GET_FW_VERSION.toByte())
-        val sumOnly = (payload.sumOf { it.toInt() and 0xFF } and 0xFF).toByte()
-        val variants = listOf(
-            "documented checksum, write with response" to (InnovaVci.GET_FW_VERSION to false),
-            "documented checksum, write without response" to (InnovaVci.GET_FW_VERSION to true),
-            "payload-only checksum, write without response" to
-                (byteArrayOf(0xAE.toByte(), sumOnly, 0x03, 0x00) + payload to true),
+        val attempts = listOf(
+            Triple("get firmware version", InnovaVci.GET_FW_VERSION, 2_000L),
+            Triple("AUTOLINK (vehicle protocol search)", InnovaVci.AUTOLINK, 15_000L),
         )
-        for ((label, variant) in variants) {
-            val (frame, noResponse) = variant
+        for ((label, frame, timeout) in attempts) {
+            InnovaVci.assertSafe(frame)
             val reply = try {
                 lock.withLock {
                     while (incoming.tryReceive().isSuccess) Unit
                     log.traffic("TX", frame)
-                    write(frame, forceNoResponse = noResponse)
+                    write(frame)
                     val buffer = java.io.ByteArrayOutputStream()
-                    withTimeoutOrNull(2_000) {
-                        while (!InnovaVci.hasCompleteFrame(buffer.toByteArray())) buffer.write(incoming.receive())
+                    withTimeoutOrNull(timeout) {
+                        while (!InnovaVci.hasCompleteReply(buffer.toByteArray())) buffer.write(incoming.receive())
                     }
                     buffer.toByteArray()
                 }
@@ -322,16 +327,17 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
                 failure?.let { throw it } // the link dropped: give up
                 continue
             }
-            val frames = InnovaVci.decode(reply).first
-            log.add("native probe ($label): ${if (reply.isEmpty()) "no answer" else "${reply.size} bytes, ${frames.size} frame(s)"}")
-            if (frames.isNotEmpty()) {
-                log.add("NATIVE PROTOCOL ANSWERED with $label")
-                break
+            val replies = InnovaVci.replies(reply)
+            log.add("native probe ($label): ${if (reply.isEmpty()) "no answer" else "${reply.size} bytes, ${replies.size} native reply frame(s)"}")
+            if (replies.isNotEmpty()) {
+                log.add("NATIVE PROTOCOL ANSWERED — using Innova's own protocol")
+                return true
             }
         }
-        // End any half-read line so the text probe that follows starts clean.
+        // Not native: end any half-read line so the text probe that follows starts clean.
         runCatching { lock.withLock { while (incoming.tryReceive().isSuccess) Unit; write("\r".toByteArray()) } }
         delay(300)
+        return false
     }
 
     private fun candidateLinks(): List<Pair<BluetoothGattCharacteristic, BluetoothGattCharacteristic>> {
