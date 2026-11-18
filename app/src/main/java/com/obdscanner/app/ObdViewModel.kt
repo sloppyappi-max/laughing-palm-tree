@@ -148,6 +148,7 @@ data class ScanState(
     val progress: Float = 0f,
     val result: SystemScan? = null,
     val full: Boolean = false,
+    val securityRunning: Boolean = false,
 )
 
 data class ExplorerState(
@@ -300,6 +301,34 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
             }
             ensureActive()
             _state.update { it.copy(scan = ScanState(result = result, full = full)) }
+        }
+    }
+
+    /**
+     * Read-only security-access discovery: for each module already found by a scan, asks whether it
+     * is locked (service 27 01) and reports the result. Never computes or sends a key, so it cannot
+     * unlock anything; safety-critical and unidentified modules are skipped.
+     */
+    fun checkSecurityAccess() {
+        val obd = client ?: return
+        val current = _state.value.scan.result ?: return
+        if (_state.value.scan.running || _state.value.scan.securityRunning) return
+        launchForConnection {
+            _state.update { it.copy(scan = it.scan.copy(securityRunning = true)) }
+            val updated = runCatching {
+                current.reports.map { report ->
+                    val status = obd.securityAccessInfo(report.module)
+                    report.copy(security = status)
+                }
+            }.getOrElse { e ->
+                if (e is CancellationException) throw e
+                if (failIfLinkLost(e)) return@launchForConnection
+                current.reports
+            }
+            ensureActive()
+            _state.update {
+                it.copy(scan = it.scan.copy(securityRunning = false, result = current.copy(reports = updated)))
+            }
         }
     }
 

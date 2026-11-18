@@ -124,7 +124,7 @@ Observed (CONFIRMED): three modules answer OBD requests on high-speed CAN — 7E
 | BCM | HS + LS (gateway) | Possible on its HS side — discovery needed |
 | AWD/transfer case | varies | Discovery needed |
 | SDM (airbag) | varies | Discovery needed; **read-only always** |
-| IPC, HVAC, radio, TPMS receiver (often BCM-integrated) | LS‑GMLAN single wire (typical) | **Likely not** — needs single-wire CAN hardware |
+| IPC, HVAC, radio, TPMS receiver (often BCM-integrated) | LS‑GMLAN single wire (typical) | **Maybe, through the BCM gateway** — the full scan now tries their high-speed request IDs; the user reports RepairSolutions2 reaches them, which would only be possible over high-speed CAN, so this is worth testing (T5/T8) |
 
 ## 6. Bidirectional capability assessment
 
@@ -135,6 +135,16 @@ Observed (CONFIRMED): three modules answer OBD requests on high-speed CAN — 7E
   3. Outputs need a tester-present kept alive. The ELM 1.3a can't do that in the background, so the app has to send it, and any gap ends the control.
   4. LS-GMLAN modules (HVAC and probably lighting) are likely physically unreachable (§5).
 - **Plan:** an Active Test Engine that only runs **documented, verified** tests from a reviewed definition file. Each test lists its preconditions (engine off / in Park), a maximum duration, an automatic return-to-normal (`$20`), and module allowlists. SDM and EBCM are excluded from outputs entirely. A test stays at "Unsupported" until it is verified on the car.
+
+## 6b. GM security access (SecurityAccess, service $27)
+
+**What the user asked for: "make the app discover gm security unlock."** Here is the honest split.
+
+- **Reading codes and live data from IPC, HVAC, radio, BCM, etc. does NOT need security access.** SecurityAccess ($27) gates *writing*: reprogramming, configuration/VIN writes, and some actuator (bi-directional) tests. Reading identity, DTCs and data parameters is unlocked. So the user's actual goal — "read the cluster/HVAC/radio like RS2" — needs module **reach**, not an unlock.
+- **The app now *discovers* security, read-only.** `securityAccessInfo()` sends `$27 01` (request seed) to a found module and reports: locked (a seed came back), open (zero seed / not required), not supported, denied, or skipped. It is exposed as a "Check security access" button on the scan card. CONFIRMED in unit tests against the simulator.
+- **The app does NOT and will not compute or send the key (`$27 02`).** GM's seed→key algorithms are proprietary authentication. Defeating them is out of scope: it is an authentication-bypass, it is unnecessary for everything on this project's read-only goal list, and it would not remove the real hardware limits. The security probe stops at discovery and never sends a key. The code enforces this (no `$27 02` path exists), and a unit test asserts only `2701` is ever sent.
+- **Safety:** the probe skips safety-critical addresses (airbag/SDM, ABS/EBCM, steering) and any module it could not positively identify.
+- **To actually run an unlock-gated function** (e.g. a GM bi-directional test that needs security), you need GM's algorithm, which comes from a licensed source (GM SPS/Tech2/MDI tooling or a licensed key provider). That is a hardware/licensing requirement, not something software can conjure.
 
 ## 7. Firmware assessment
 
@@ -168,6 +178,7 @@ Use the newest build each time. Engine running unless noted. Share **Vehicle →
 | T4 | Capability tester (next build): `ATCAF0` + a known request, `ATCRA`, `ATMA` for 2 s, `ATSP` variants | Which ELM features really work (behaviour, not `OK`) |
 | T5 | Read-only identity per address: `$1A 90` / `$1A B0` at 7E0/7E2 and 0x241–0x25F; `$22 F190` | Which modules exist on HS-GMLAN, and whether the VCI filters GM services |
 | T6 | GMLAN `$A9` DTC read per found module | Full-system code read |
+| T8 | Full scan, then read each found module's identity and codes; tap **Check security access** | Which modules exist (incl. body modules via gateway), their real names, and which are security-locked (read-only) |
 | T7 | Look into the dongle's plug: is there a metal contact in **pin 1** (top row, far left with the wide side up)? Photo is enough | Dongles usually only populate the pins they use. An empty pin 1 proves no single-wire GMLAN |
 
 Each step only reads. Nothing in T1–T7 writes to a module or to the dongle.

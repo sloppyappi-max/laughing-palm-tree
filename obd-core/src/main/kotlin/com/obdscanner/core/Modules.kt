@@ -70,21 +70,39 @@ data class Module(val requestId: Int, val responseId: Int) {
     val requestHex: String get() = "%03X".format(requestId)
     val responseHex: String get() = "%03X".format(responseId)
 
-    /** Best-known name; GM-style addresses are a guess until confirmed on a car. */
+    /**
+     * Best-known name. Only the engine and transmission addresses are named with confidence; every
+     * other address is shown as its hex ID, because GM address→module mapping varies by vehicle and
+     * guessing it would be inventing. The scan reads each module's real identity string separately.
+     */
     val name: String get() = KNOWN[requestId] ?: "Module $requestHex"
+
+    /**
+     * Whether this looks like a safety-critical module (airbag, ABS/brake, steering) from its address.
+     * Used only to keep the read-only security probe away from them; it is deliberately cautious.
+     */
+    val isSafetyCritical: Boolean get() = requestId in SAFETY_ADDRESSES
 
     companion object {
         private val KNOWN = mapOf(
             0x7E0 to "Engine (ECM)",
-            0x7E1 to "Transmission / module 2",
             0x7E2 to "Transmission (TCM)",
-            0x7E3 to "Module 4 (often hybrid / ABS)",
-            0x7E4 to "Module 5 (often battery / BCM)",
-            0x7E5 to "Module 6",
-            0x7E6 to "Module 7",
-            0x7E7 to "Module 8",
         )
+
+        // GM high-speed GMLAN addresses commonly used by restraint (SDM) and brake (EBCM) modules.
+        // Conservative: the security probe skips these, and also skips anything it can't identify.
+        private val SAFETY_ADDRESSES = setOf(0x7E3, 0x242, 0x244, 0x247, 0x24A)
     }
+}
+
+/** Result of the read-only security-access discovery for one module. It never unlocks anything. */
+enum class SecurityStatus(val label: String) {
+    LOCKED("Locked — supports security access (seed received). No key is computed or sent."),
+    UNLOCKED("Open — no key needed right now (already unlocked, or no seed required)."),
+    NOT_SUPPORTED("No security access on this module."),
+    DENIED("Request refused by the module."),
+    SKIPPED_SAFETY("Skipped — safety-critical or unidentified module."),
+    NO_ANSWER("No answer."),
 }
 
 enum class DtcProtocol(val label: String) { UDS("UDS"), GMLAN("GMLAN") }
@@ -113,6 +131,10 @@ data class ModuleReport(
     val dtcs: List<ModuleDtc>,
     /** Null when codes were read; otherwise why not. */
     val problem: String? = null,
+    /** The module's own identity string (ECU name / part number), read-only. Null if it gave none. */
+    val identity: String? = null,
+    /** Set after a read-only security-access check is run on this module. */
+    val security: SecurityStatus? = null,
 )
 
 /** Result of an all-system scan, including the raw exchange for troubleshooting. */

@@ -53,17 +53,18 @@ fun SystemScanCard(state: UiState, viewModel: ObdViewModel) {
                 return@Column
             }
             Hint(
-                "Asks every module on the main network (engine, transmission, ABS, airbag, …) for its trouble codes. " +
-                    "Read-only. Modules on GM's single-wire network (some body modules) can't be reached with an ELM327.",
+                "Asks every module on the main network (engine, transmission, ABS, airbag, …) for its identity and " +
+                    "trouble codes. Read-only. A full scan also tries body modules (cluster, HVAC, radio) through the " +
+                    "gateway — whether they answer depends on the vehicle.",
             )
             Row {
-                Button(onClick = { viewModel.scanModules(full = false) }, enabled = !scan.running) { Text("Quick scan") }
+                Button(onClick = { viewModel.scanModules(full = false) }, enabled = !scan.running && !scan.securityRunning) { Text("Quick scan") }
                 Spacer(Modifier.width(12.dp))
-                OutlinedButton(onClick = { viewModel.scanModules(full = true) }, enabled = !scan.running) { Text("Full scan") }
+                OutlinedButton(onClick = { viewModel.scanModules(full = true) }, enabled = !scan.running && !scan.securityRunning) { Text("Full scan") }
             }
             if (scan.running) {
                 LinearProgressIndicator(progress = { scan.progress }, modifier = Modifier.fillMaxWidth())
-                Hint(if (scan.full) "Full scan checks ~250 addresses and takes about a minute." else "Checking modules…")
+                Hint(if (scan.full) "Full scan checks ~300 addresses and takes about a minute." else "Checking modules…")
             }
             scan.result?.let { result ->
                 if (result.reports.isEmpty()) {
@@ -74,6 +75,17 @@ fun SystemScanCard(state: UiState, viewModel: ObdViewModel) {
                 result.reports.forEach { report ->
                     HorizontalDivider()
                     ModuleRow(report)
+                }
+                if (result.reports.isNotEmpty()) {
+                    HorizontalDivider()
+                    OutlinedButton(
+                        onClick = { viewModel.checkSecurityAccess() },
+                        enabled = !scan.running && !scan.securityRunning,
+                    ) { Text(if (scan.securityRunning) "Checking…" else "Check security access") }
+                    Hint(
+                        "Read-only: reports which modules are locked with GM security access. It does not and cannot " +
+                            "unlock them — no key is computed or sent. Airbag/ABS and unidentified modules are skipped.",
+                    )
                 }
                 TextButton(onClick = {
                     val send = Intent(Intent.ACTION_SEND).apply {
@@ -93,7 +105,7 @@ private fun ModuleRow(report: ModuleReport) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text(report.module.name, fontWeight = FontWeight.SemiBold)
+                Text(report.identity?.takeIf { it.isNotBlank() } ?: report.module.name, fontWeight = FontWeight.SemiBold)
                 Hint("Address ${report.module.requestHex} → ${report.module.responseHex}")
             }
             Text(
@@ -111,6 +123,7 @@ private fun ModuleRow(report: ModuleReport) {
             )
         }
         report.problem?.let { Hint(it) }
+        report.security?.let { Hint("Security access: ${it.label}") }
         report.dtcs.forEach { dtc ->
             Column(Modifier.padding(start = 8.dp)) {
                 Text(

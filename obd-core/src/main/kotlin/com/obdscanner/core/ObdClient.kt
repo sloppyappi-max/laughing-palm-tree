@@ -475,10 +475,13 @@ class ObdClient(private val channel: ElmChannel) {
     }
 
     /**
-     * All-system scan: asks every candidate address on the main CAN bus whether a module is there
-     * (TesterPresent), then reads each module's trouble codes. [onProgress] gets 0..1.
+     * All-system scan: asks every candidate address on the main CAN bus whether a module answers
+     * (any reply, including a negative one, proves it is there), reads each module's identity and
+     * then its trouble codes. [onProgress] gets 0..1.
      *
-     * Body modules on GM's single-wire low-speed bus (OBD pin 1) can't be reached by an ELM327.
+     * On GM, body/comfort modules (IPC, HVAC, radio) sit on the single-wire low-speed bus, but the
+     * BCM gateways diagnostic requests from the high-speed bus to them, so a full scan may still
+     * reach them through their high-speed request IDs. Whether this works is vehicle-specific.
      */
     suspend fun scanModules(full: Boolean = false, onProgress: (Float) -> Unit = {}): SystemScan {
         val log = StringBuilder()
@@ -487,9 +490,12 @@ class ObdClient(private val channel: ElmChannel) {
             return SystemScan(emptyList(), "Module scan needs an 11-bit CAN car (most 2008+ US vehicles).")
         }
         val candidates = buildList {
-            addAll(0x7E0..0x7E7)
-            addAll(0x240..0x25F) // GM high-speed GMLAN physical addresses
-            if (full) addAll((0x700..0x7DF).filterNot { it in 0x7E0..0x7E7 })
+            addAll(0x7E0..0x7E7)   // ISO 15765 / powertrain physical addresses
+            addAll(0x241..0x25F)   // GM high-speed GMLAN physical request IDs (-> 0x641..0x65F)
+            if (full) {
+                addAll(0x260..0x27F) // more GMLAN addresses (body/chassis, often gatewayed)
+                addAll((0x700..0x7DF).filterNot { it in 0x7E0..0x7E7 })
+            }
         }
         return session {
             timeoutChanged = true
@@ -497,8 +503,7 @@ class ObdClient(private val channel: ElmChannel) {
             val found = mutableListOf<Module>()
             candidates.forEachIndexed { i, id ->
                 onProgress(i.toFloat() / (candidates.size * 2))
-                val answer = runCatching { requestFrom(id, "3E00", timeoutMs = 500) }.getOrNull()
-                if (answer != null) {
+                if (moduleAnswers(id)) {
                     found += Module(id, responseIdFor(id))
                     note("found %03X -> %03X".format(id, responseIdFor(id)))
                 }
@@ -507,10 +512,76 @@ class ObdClient(private val channel: ElmChannel) {
             note("modules: ${found.size}")
             val reports = found.mapIndexed { i, module ->
                 onProgress(0.5f + i.toFloat() / (found.size * 2).coerceAtLeast(1))
-                readModuleDtcs(module, ::note)
+                val identity = runCatching { readModuleIdentity(module) }.getOrNull()
+                identity?.let { note("%03X identity: %s".format(module.requestId, it)) }
+                readModuleDtcs(module, ::note).copy(identity = identity)
             }
             onProgress(1f)
             SystemScan(reports, log.toString())
+        }
+    }
+
+    /**
+     * True if a module at [requestId] replies to a harmless read at all. A negative reply (7F …)
+     * counts: it still proves the module is on the bus. TesterPresent alone is unreliable (GM's is
+     * a bare `3E`, and the engine computer answered `NO DATA` to `3E00`), so this reads an identifier.
+     */
+    private suspend fun moduleAnswers(requestId: Int): Boolean {
+        target(requestId)
+        for (cmd in listOf("1A90", "22F190")) { // GMLAN then UDS "read VIN"
+            if (framesOf(sx(cmd, 600), cmd).isNotEmpty()) return true
+        }
+        return false
+    }
+
+    /** Decodes each hex line of [raw] to bytes (header stripped when present); drops NO DATA / errors. */
+    private fun framesOf(raw: String, command: String): List<ByteArray> =
+        ElmResponseParser.lines(raw, command).mapNotNull { line ->
+            val h = line.replace(" ", "").uppercase()
+            if (h.isEmpty() || h.length % 2 != 0 || h.any { it !in "0123456789ABCDEF" }) null
+            else ElmResponseParser.stripCanHeader(h) ?: ElmResponseParser.hexToBytes(h)
+        }
+
+    /**
+     * Reads a human-readable identity for a module (ECU name or part number), read-only. Tries UDS
+     * $22 F197 (system name) and F187 (spare part number), then GMLAN $1A B0. Null if none answer.
+     */
+    private suspend fun readModuleIdentity(module: Module): String? {
+        for (cmd in listOf("22F197", "22F187", "1AB0")) {
+            val data = runCatching { requestFrom(module.requestId, cmd, timeoutMs = 1_000) }.getOrNull() ?: continue
+            val text = data.map { it.toInt() and 0xFF }.filter { it in 0x20..0x7E }.map { it.toChar() }.joinToString("").trim()
+            if (text.length >= 3) return text
+        }
+        return null
+    }
+
+    /**
+     * Read-only security-access discovery: asks one module for a SecurityAccess seed (service $27 01)
+     * and reports what came back. It NEVER sends or computes a key ($27 02), so it cannot unlock a
+     * module — it only discovers whether one is locked and at what level. Safety-critical modules
+     * (airbag, ABS/brake, steering) and modules whose identity could not be confirmed are skipped.
+     */
+    suspend fun securityAccessInfo(module: Module): SecurityStatus {
+        if (!supportsModuleAccess) return SecurityStatus.NOT_SUPPORTED
+        if (module.isSafetyCritical) return SecurityStatus.SKIPPED_SAFETY
+        return session {
+            target(module.requestId)
+            val frames = framesOf(sx("2701", 1_500), "2701")
+            val positive = frames.firstOrNull { it.isNotEmpty() && it.u(0) == 0x67 }
+            if (positive != null) {
+                val seed = positive.drop(2)
+                return@session if (seed.isNotEmpty() && seed.all { it.toInt() == 0 }) SecurityStatus.UNLOCKED
+                else SecurityStatus.LOCKED
+            }
+            val negative = frames.firstOrNull { it.size >= 3 && it.u(0) == 0x7F && it.u(1) == 0x27 }
+            if (negative != null) {
+                return@session when (negative.u(2)) {
+                    0x11, 0x12 -> SecurityStatus.NOT_SUPPORTED // service / sub-function not supported
+                    0x22 -> SecurityStatus.UNLOCKED           // conditionsNotCorrect (often already unlocked)
+                    else -> SecurityStatus.DENIED
+                }
+            }
+            SecurityStatus.NO_ANSWER
         }
     }
 

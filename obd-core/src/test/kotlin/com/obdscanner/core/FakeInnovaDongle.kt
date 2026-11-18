@@ -35,9 +35,19 @@ class FakeInnovaDongle(
         // Ask the simulated car, addressed like the request.
         car.exchange("ATSH%03X".format(address))
         val command = data.joinToString("") { "%02X".format(it) }
-        val answer = ElmResponseParser.parse(car.exchange(command), command)
+        val raw = car.exchange(command)
         val source = if (address == 0x7DF) 0x7E8 else if (address < 0x300) address + 0x400 else address + 8
-        val messages = (answer as? ObdResponse.Data)?.messages.orEmpty()
+        // A real VCI relays whatever the module sends, including negative responses (7F …), which
+        // ObdResponse.parse drops — so recover those from the raw text when there's no positive data.
+        val messages = (ElmResponseParser.parse(raw, command) as? ObdResponse.Data)?.messages?.takeIf { it.isNotEmpty() }
+            ?: ElmResponseParser.lines(raw, command).mapNotNull { line ->
+                val h = line.replace(" ", "").uppercase()
+                if (h.length >= 2 && h.length % 2 == 0 && h.all { it in "0123456789ABCDEF" }) {
+                    ElmResponseParser.stripCanHeader(h) ?: ElmResponseParser.hexToBytes(h)
+                } else {
+                    null
+                }
+            }
         val records = messages.fold(ByteArray(0)) { acc, m ->
             val msg = be32(source) + m
             acc + byteArrayOf(InnovaVci.TYPE_OBD_DATA.toByte(), 0, 0) + le16(InnovaVci.PROTO_CAN) +
