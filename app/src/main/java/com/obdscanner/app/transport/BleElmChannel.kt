@@ -12,6 +12,8 @@ import android.content.Context
 import android.os.Build
 import com.obdscanner.core.ElmChannel
 import com.obdscanner.core.ElmTimeoutException
+import com.obdscanner.core.InnovaVci
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Mutex
@@ -57,6 +59,9 @@ private val KNOWN_LAYOUTS = listOf(
         UUID.fromString("BEF8D6C9-9C21-4C9E-B632-BD58C1009F9F"),
     ),
 )
+
+/** Bluetooth names Innova code readers advertise (e.g. "CodeReader31C"). */
+private val INNOVA_NAME = Regex("CodeReader|Innova", RegexOption.IGNORE_CASE)
 
 /** Standard services that never carry adapter data. */
 private val IGNORED_SERVICES = setOf(
@@ -195,8 +200,8 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
             buffer.toByteArray()
         }
 
-    private suspend fun write(data: ByteArray) {
-        val type = if (writeChar.can(BluetoothGattCharacteristic.PROPERTY_WRITE)) {
+    private suspend fun write(data: ByteArray, forceNoResponse: Boolean = false) {
+        val type = if (!forceNoResponse && writeChar.can(BluetoothGattCharacteristic.PROPERTY_WRITE)) {
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         } else {
             BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
@@ -248,6 +253,9 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
         val candidates = candidateLinks()
         if (candidates.isEmpty()) throw IOException("This device has no characteristics that look like a serial data link.")
 
+        val name = runCatching { device.name }.getOrNull().orEmpty()
+        if (INNOVA_NAME.containsMatchIn(name)) probeInnovaNativeFirst(candidates.first())
+
         // Brand dongles (Innova, BlueDriver-style…) can expose several data services. Try each and keep
         // the one that answers a harmless "identify" command (ATI) like an ELM327 does.
         for ((notify, write) in candidates) {
@@ -272,6 +280,60 @@ class BleElmChannel private constructor(private val log: BleLog) : ElmChannel, B
     }
 
     /** Notify/write pairs worth trying: known adapter layouts first, then every other plausible pair. */
+    /**
+     * Innova dongles answer AT commands in a limited ELM327 mode and seem to pick that mode from the
+     * first data they receive. Before any text, send the native read-only "get firmware version"
+     * frame and log any answer. Variants differ only in write type and checksum style; the
+     * command is always the same read-only request.
+     */
+    private suspend fun probeInnovaNativeFirst(link: Pair<BluetoothGattCharacteristic, BluetoothGattCharacteristic>) {
+        val (notify, write) = link
+        log.add("Innova native probe (before any text) on notify=${notify.uuid} write=${write.uuid}")
+        try {
+            enableNotifications(notify)
+            writeChar = write
+        } catch (e: IOException) {
+            log.add("native probe: could not set up (${e.message})")
+            return
+        }
+        val payload = byteArrayOf(0x00, InnovaVci.CMD_SYSTEM.toByte(), InnovaVci.SYSTEM_GET_FW_VERSION.toByte())
+        val sumOnly = (payload.sumOf { it.toInt() and 0xFF } and 0xFF).toByte()
+        val variants = listOf(
+            "documented checksum, write with response" to (InnovaVci.GET_FW_VERSION to false),
+            "documented checksum, write without response" to (InnovaVci.GET_FW_VERSION to true),
+            "payload-only checksum, write without response" to
+                (byteArrayOf(0xAE.toByte(), sumOnly, 0x03, 0x00) + payload to true),
+        )
+        for ((label, variant) in variants) {
+            val (frame, noResponse) = variant
+            val reply = try {
+                lock.withLock {
+                    while (incoming.tryReceive().isSuccess) Unit
+                    log.traffic("TX", frame)
+                    write(frame, forceNoResponse = noResponse)
+                    val buffer = java.io.ByteArrayOutputStream()
+                    withTimeoutOrNull(2_000) {
+                        while (!InnovaVci.hasCompleteFrame(buffer.toByteArray())) buffer.write(incoming.receive())
+                    }
+                    buffer.toByteArray()
+                }
+            } catch (e: IOException) {
+                log.add("native probe ($label): ${e.message}")
+                failure?.let { throw it } // the link dropped: give up
+                continue
+            }
+            val frames = InnovaVci.decode(reply).first
+            log.add("native probe ($label): ${if (reply.isEmpty()) "no answer" else "${reply.size} bytes, ${frames.size} frame(s)"}")
+            if (frames.isNotEmpty()) {
+                log.add("NATIVE PROTOCOL ANSWERED with $label")
+                break
+            }
+        }
+        // End any half-read line so the text probe that follows starts clean.
+        runCatching { lock.withLock { while (incoming.tryReceive().isSuccess) Unit; write("\r".toByteArray()) } }
+        delay(300)
+    }
+
     private fun candidateLinks(): List<Pair<BluetoothGattCharacteristic, BluetoothGattCharacteristic>> {
         val out = mutableListOf<Pair<BluetoothGattCharacteristic, BluetoothGattCharacteristic>>()
         for ((serviceId, notifyId, writeId) in KNOWN_LAYOUTS) {
